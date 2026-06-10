@@ -48,12 +48,14 @@ class ExecutionEngine:
         params: ExecParams,
         dry_run: bool,
         logger: Any | None = None,
+        run_id: int | None = None,
     ):
         self.client = client
         self.db = db
         self.params = params
         self.dry_run = dry_run
         self.log = logger
+        self.run_id = run_id
 
     def _log(self, event: str, **kw: Any) -> None:
         if self.log is not None:
@@ -89,6 +91,7 @@ class ExecutionEngine:
                 limit_price=limit_price,
                 status="dry_run",
                 reason=reason,
+                run_id=self.run_id,
             )
             self._log("dry_run_order", symbol=symbol, side=side.value, qty=qty, limit=limit_price)
             return {"status": "dry_run", "order_id": order_id, "limit_price": limit_price}
@@ -104,6 +107,7 @@ class ExecutionEngine:
                 limit_price=limit_price,
                 status="error",
                 reason=f"{reason} | {exc}",
+                run_id=self.run_id,
             )
             self._log("order_error", symbol=symbol, error=str(exc))
             return {"status": "error", "order_id": order_id, "limit_price": limit_price}
@@ -119,6 +123,7 @@ class ExecutionEngine:
             status=status,
             reason=reason,
             alpaca_order_id=alpaca_id,
+            run_id=self.run_id,
         )
         self._log("order_submitted", symbol=symbol, side=side.value, qty=qty, alpaca_id=alpaca_id)
         return {

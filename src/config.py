@@ -138,6 +138,38 @@ class Settings(BaseSettings):
             order_fill_timeout_sec=self.order_fill_timeout_sec,
         )
 
+    def param_snapshot(self) -> dict[str, float | int | bool | str]:
+        """All decision-affecting thresholds, for provenance hashing.
+
+        Excludes run attributes (dry_run, source) and secrets — those live on
+        the runs row, not the param_set.
+        """
+        return {
+            "min_price": self.min_price,
+            "max_price": self.max_price,
+            "min_day_change_pct": self.min_day_change_pct,
+            "max_day_change_pct": self.max_day_change_pct,
+            "min_rvol": self.min_rvol,
+            "min_volume_acceleration": self.min_volume_acceleration,
+            "max_spread_pct": self.max_spread_pct,
+            "stop_loss_pct": self.stop_loss_pct,
+            "take_profit_pct": self.take_profit_pct,
+            "scale_out_fraction": self.scale_out_fraction,
+            "trailing_stop_pct": self.trailing_stop_pct,
+            "max_hold_minutes": self.max_hold_minutes,
+            "exit_spread_pct": self.exit_spread_pct,
+            "force_close_before_close_minutes": self.force_close_before_close_minutes,
+            "max_risk_per_trade_pct": self.max_risk_per_trade_pct,
+            "max_position_value": self.max_position_value,
+            "max_concurrent_positions": self.max_concurrent_positions,
+            "daily_max_loss_pct": self.daily_max_loss_pct,
+            "max_daily_trades": self.max_daily_trades,
+            "limit_slippage_pct": self.limit_slippage_pct,
+            "order_fill_timeout_sec": self.order_fill_timeout_sec,
+            "screener_top_n": self.screener_top_n,
+            "polygon_intraday": self.polygon_intraday,
+        }
+
 
 def load_settings() -> Settings:
     return Settings()

@@ -7,6 +7,7 @@ ISO-8601 UTC-ish strings; date filtering uses substr on the first 10 chars.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -16,6 +17,24 @@ from typing import Any
 from src.models import OrderSide
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS param_sets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash TEXT NOT NULL UNIQUE,
+    params_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    universe_source TEXT,
+    dry_run INTEGER NOT NULL DEFAULT 1,
+    param_set_id INTEGER,
+    git_commit TEXT,
+    notes TEXT
+);
+
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
@@ -26,7 +45,8 @@ CREATE TABLE IF NOT EXISTS signals (
     volume_acceleration REAL,
     spread_pct REAL,
     score REAL,
-    reason_json TEXT
+    reason_json TEXT,
+    run_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -39,7 +59,8 @@ CREATE TABLE IF NOT EXISTS orders (
     order_type TEXT NOT NULL,
     limit_price REAL,
     status TEXT NOT NULL,
-    reason TEXT
+    reason TEXT,
+    run_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS positions (
@@ -53,7 +74,8 @@ CREATE TABLE IF NOT EXISTS positions (
     exit_price REAL,
     pnl_pct REAL,
     pnl_amount REAL,
-    exit_reason TEXT
+    exit_reason TEXT,
+    run_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS screened (
@@ -68,6 +90,7 @@ CREATE TABLE IF NOT EXISTS screened (
     volume_acceleration REAL,
     spread_pct REAL,
     entry_ready INTEGER NOT NULL DEFAULT 0,
+    run_id INTEGER,
     UNIQUE(session_date, symbol, source)
 );
 
@@ -103,6 +126,57 @@ class Database:
     def close(self) -> None:
         self.conn.close()
 
+    # ---- provenance (runs + parameter sets) ----
+    def start_run(
+        self,
+        params: dict[str, Any],
+        mode: str,
+        universe_source: str,
+        dry_run: bool,
+        git_commit: str | None = None,
+        notes: str = "",
+    ) -> int:
+        """Open a run tied to the exact parameter set; return its run_id.
+
+        Identical params dedupe to one param_set (hashed canonical json) so the
+        same config across many runs is comparable.
+        """
+        param_set_id = self._ensure_param_set(params)
+        cur = self.conn.execute(
+            """INSERT INTO runs
+               (started_at, mode, universe_source, dry_run, param_set_id, git_commit, notes)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                datetime.now(UTC).isoformat(),
+                mode,
+                universe_source,
+                1 if dry_run else 0,
+                param_set_id,
+                git_commit,
+                notes,
+            ),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def _ensure_param_set(self, params: dict[str, Any]) -> int:
+        canonical = json.dumps(params, sort_keys=True, default=str)
+        digest = hashlib.sha256(canonical.encode()).hexdigest()
+        self.conn.execute(
+            "INSERT OR IGNORE INTO param_sets (hash, params_json, created_at) VALUES (?,?,?)",
+            (digest, canonical, datetime.now(UTC).isoformat()),
+        )
+        row = self.conn.execute("SELECT id FROM param_sets WHERE hash=?", (digest,)).fetchone()
+        return int(row["id"])
+
+    def get_run(self, run_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_param_set(self, param_set_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM param_sets WHERE id=?", (param_set_id,)).fetchone()
+        return dict(row) if row else None
+
     # ---- signals ----
     def insert_signal(
         self,
@@ -115,12 +189,13 @@ class Database:
         score: float,
         reason: dict[str, Any] | None = None,
         timestamp: datetime | None = None,
+        run_id: int | None = None,
     ) -> int:
         cur = self.conn.execute(
             """INSERT INTO signals
                (timestamp, symbol, price, day_change_pct, rvol,
-                volume_acceleration, spread_pct, score, reason_json)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                volume_acceleration, spread_pct, score, reason_json, run_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
                 _iso(timestamp),
                 symbol,
@@ -131,6 +206,7 @@ class Database:
                 spread_pct,
                 score,
                 json.dumps(reason or {}),
+                run_id,
             ),
         )
         self.conn.commit()
@@ -157,12 +233,13 @@ class Database:
         reason: str | None = None,
         alpaca_order_id: str | None = None,
         timestamp: datetime | None = None,
+        run_id: int | None = None,
     ) -> int:
         cur = self.conn.execute(
             """INSERT INTO orders
                (timestamp, alpaca_order_id, symbol, side, qty,
-                order_type, limit_price, status, reason)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                order_type, limit_price, status, reason, run_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (
                 _iso(timestamp),
                 alpaca_order_id,
@@ -173,6 +250,7 @@ class Database:
                 limit_price,
                 status,
                 reason,
+                run_id,
             ),
         )
         self.conn.commit()
@@ -205,12 +283,17 @@ class Database:
 
     # ---- positions ----
     def insert_position(
-        self, symbol: str, entry_time: datetime, entry_price: float, qty: int
+        self,
+        symbol: str,
+        entry_time: datetime,
+        entry_price: float,
+        qty: int,
+        run_id: int | None = None,
     ) -> int:
         cur = self.conn.execute(
-            """INSERT INTO positions (symbol, entry_time, entry_price, qty, current_status)
-               VALUES (?,?,?,?, 'open')""",
-            (symbol, _iso(entry_time), entry_price, qty),
+            """INSERT INTO positions (symbol, entry_time, entry_price, qty, current_status, run_id)
+               VALUES (?,?,?,?, 'open', ?)""",
+            (symbol, _iso(entry_time), entry_price, qty, run_id),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -284,6 +367,7 @@ class Database:
         snapshots: list[Any],
         source: str,
         entry_ready: set[str] | None = None,
+        run_id: int | None = None,
     ) -> int:
         """Persist every screened runner, idempotent per (session_date, symbol, source).
 
@@ -297,8 +381,8 @@ class Database:
             self.conn.execute(
                 """INSERT INTO screened
                    (screened_at, session_date, symbol, source, last_price,
-                    day_change_pct, rvol, volume_acceleration, spread_pct, entry_ready)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                    day_change_pct, rvol, volume_acceleration, spread_pct, entry_ready, run_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(session_date, symbol, source) DO UPDATE SET
                      screened_at=excluded.screened_at,
                      last_price=excluded.last_price,
@@ -306,7 +390,8 @@ class Database:
                      rvol=excluded.rvol,
                      volume_acceleration=excluded.volume_acceleration,
                      spread_pct=excluded.spread_pct,
-                     entry_ready=excluded.entry_ready""",
+                     entry_ready=excluded.entry_ready,
+                     run_id=excluded.run_id""",
                 (
                     datetime.now(UTC).isoformat(),
                     ts.date().isoformat(),
@@ -318,6 +403,7 @@ class Database:
                     s.volume_acceleration,
                     s.spread_pct,
                     1 if s.symbol in ready else 0,
+                    run_id,
                 ),
             )
             count += 1
