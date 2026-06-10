@@ -1,9 +1,167 @@
 # BStalk3r
 
-Low Float Momentum Runner research system on **Alpaca Paper Trading**.
+**Low Float Momentum Runner** research system on **Alpaca Paper Trading**.
 
-Rule-based realtime execution (no LLM in the realtime loop), full SQLite audit trail,
-dry-run by default. See the `feat/low-float-runner` branch / PR for the full
-implementation.
+Detects intraday low-float / high-RVOL runners, enters with rule-based limit
+orders, manages exits (stop / scale-out / trailing / time / spread), and logs
+**every** signal, order, position and P&L to SQLite. Realtime decisions are
+100% rule-based and synchronous — **no LLM / AI is ever called in the trading
+loop** (speed + determinism). AI is reserved, optionally, for *post-market*
+reports only.
 
-> ⚠️ Research / paper-trading only. Live trading is intentionally unsupported.
+> ⚠️ **Research / paper-trading only.** Live trading is unsupported *by design*:
+> the app refuses to start unless it is pointed at the Alpaca paper endpoint
+> with `PAPER=true`. Orders go to a paper account; nothing here can place a
+> live order.
+
+---
+
+## Architecture
+
+```
+            ┌──────────────┐   snapshots   ┌────────────┐
+ universe ─▶│ market_data  │──────────────▶│  scanner   │ filter + rank (pure)
+            │ (Alpaca/IEX) │               └─────┬──────┘
+            └──────────────┘                     ▼
+                                           ┌────────────┐
+                                           │  strategy  │ entry / exit rules (pure)
+                                           └─────┬──────┘
+                                                 ▼
+                                           ┌────────────┐  veto
+                                           │    risk    │ sizing + limits (pure)
+                                           └─────┬──────┘
+                                                 ▼
+            ┌──────────────┐   limit order  ┌────────────┐
+            │ alpaca_client│◀───────────────│ execution  │ dry-run aware
+            └──────────────┘                └─────┬──────┘
+                                                  ▼
+                                           ┌────────────┐
+                                           │  database  │ SQLite audit trail
+                                           └─────┬──────┘
+                                                 ▼
+                                           ┌────────────┐
+                                           │  reporter  │ end-of-day report
+                                           └────────────┘
+```
+
+- **Pure, fully-tested rule modules** (`scanner`, `strategy`, `risk`) depend only
+  on plain dataclasses — never on the Alpaca SDK — so they are fast and trivially
+  unit-tested.
+- **SDK is isolated** in `alpaca_client` (trading) and `market_data` (quotes/bars).
+  Swap in Polygon/Finnhub/Nasdaq Data Link later by implementing
+  `MarketDataProvider` / `FundamentalsProvider`; nothing else changes.
+
+---
+
+## Quick start
+
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/) (or plain `pip`).
+
+```bash
+# 1. install
+uv venv && uv pip install -e ".[dev]"
+#    (pip:  python -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]")
+
+# 2. configure — copy the template and paste your PAPER keys
+cp .env.example .env
+#    edit .env -> ALPACA_API_KEY / ALPACA_SECRET_KEY  (from the Paper dashboard)
+
+# 3. confirm the paper account connects
+uv run bstalk3r check
+#    ✅ Paper account connected | equity=100000 buying_power=... dry_run=True
+
+# 4. scan the watchlist once (logs signals to SQLite, places nothing)
+uv run bstalk3r scan
+
+# 5. run the realtime loop — DRY_RUN=true by default: evaluates + logs, no orders
+uv run bstalk3r run            # ctrl-C force-closes open positions
+uv run bstalk3r run --once     # single tick then exit (handy for testing)
+
+# 6. end-of-day report (markdown + json under reports/)
+uv run bstalk3r report                 # today (UTC)
+uv run bstalk3r report --date 2026-06-10
+```
+
+### Getting Alpaca paper keys
+Log in at <https://app.alpaca.markets/>, switch to the **Paper** account, open
+**"View API Keys"**, generate a key pair, and paste both into `.env`. Keys are
+never committed (`.env` is git-ignored; only `.env.example` is tracked).
+
+---
+
+## Dry-run & safety
+
+| Guard | Behaviour |
+|---|---|
+| `DRY_RUN=true` (default) | Rules run and every decision is logged, but **no order is sent** — orders are stored with status `dry_run`. |
+| `PAPER=true` (required) | App **refuses to start** if `false`. |
+| `ALPACA_BASE_URL` | Must be the paper host (`paper-api.alpaca.markets`); a live URL is rejected at startup. |
+| Risk gate | New entries are vetoed on max-positions, daily-trade cap, daily-loss limit, or any data error. |
+| Data outage | A failed market-data fetch marks the loop "unhealthy" and **halts new entries** (open positions are still managed). |
+
+Flip `DRY_RUN=false` only when you want the loop to actually place **paper**
+orders. There is no live path.
+
+---
+
+## Strategy (v0)
+
+**Entry** (all must hold, position not already open):
+price ∈ `[$1, $50]`, day change ∈ `[5%, 40%]`, `RVOL ≥ 8`,
+`volume_acceleration ≥ 3`, spread within `MAX_SPREAD_PCT`.
+
+**Exit** (priority order): force-close near the bell → stop-loss `-5%` →
+max-hold `30 min` → spread blow-out → trailing stop `-8%` from peak →
+first take-profit at `+15%` scales out `50%`.
+
+**Sizing / risk:** at most `1%` of equity at risk per trade (bounded by the
+`-5%` stop distance), capped by `MAX_POSITION_VALUE`; `1–3` concurrent
+positions; halt new entries at `-3%` on the day or after `MAX_DAILY_TRADES`.
+
+All thresholds live in `.env` (see `.env.example`) and are loaded via
+`pydantic-settings`.
+
+### `float` / market cap
+No reliable **free** source provides share float, so `float_shares` /
+`market_cap` are **nullable** and the v0 rules work without them. The
+`FundamentalsProvider` interface is ready for a paid source later.
+
+---
+
+## Data feed limitations (free / IEX)
+
+The free Alpaca feed is **IEX**, which cannot screen the whole market and is
+thinner than SIP. Consequences for v0:
+
+- The scanner evaluates a configured **watchlist** (`UNIVERSE` in `.env`), not
+  the entire market. Plug in a real screener (Polygon/Finnhub) via
+  `MarketDataProvider` to widen it.
+- `RVOL` here = today's cumulative volume ÷ 20-day average daily volume; it
+  **understates** RVOL early in the session. Good enough as a momentum proxy.
+- Set `DATA_FEED=sip` only if your account is subscribed to SIP.
+
+---
+
+## Development
+
+```bash
+uv run pytest --cov=src --cov-fail-under=80   # tests + coverage gate
+uv run ruff check src/ tests/                 # lint
+uv run ruff format src/ tests/                # format
+```
+
+The pure rule modules are exhaustively unit-tested; the loop wiring is covered
+with Alpaca mocked at the boundary. The SDK glue + live commands are verified
+against a paper account via `docs/e2e/low-float-runner-checklist.md`.
+
+A `.devcontainer/` is provided for a reproducible Python 3.11 environment.
+
+## SQLite schema
+
+`signals`, `orders`, `positions`, `daily_stats` — the full audit trail. Inspect
+with any SQLite client:
+
+```bash
+sqlite3 data/bstalk3r.db ".tables"
+sqlite3 data/bstalk3r.db "SELECT symbol, status, limit_price FROM orders ORDER BY id DESC LIMIT 10;"
+```
