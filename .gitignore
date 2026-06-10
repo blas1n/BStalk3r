@@ -8,6 +8,7 @@
 *.sqlite
 *.sqlite3
 data/
+logs/
 reports/
 
 # Python

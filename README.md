@@ -177,6 +177,40 @@ held positions during exits. Consequences for v0:
 
 ---
 
+## Scheduled accumulation (launchd, macOS)
+
+The point of the data layers is to **accumulate daily**. A launchd agent runs
+`scan` + `track` each weekday morning so the runner universe and forward outcomes
+build up unattended.
+
+```bash
+# install / refresh the agent for the current checkout (renders paths, loads it)
+bash scripts/install-launchd.sh
+
+# run the job once now to verify
+bash scripts/daily.sh
+tail -f logs/daily-$(date +%Y%m%d).log
+
+# is it registered?
+launchctl list | grep bstalk3r
+
+# remove it
+bash scripts/install-launchd.sh --uninstall
+```
+
+- Schedule: **Tue–Sat 09:00 host-local** — captures each US session (Mon–Fri
+  close) the next morning, once free-tier EOD data is available.
+- Job: `bstalk3r scan` (persist the latest session's screened runners) then
+  `bstalk3r track` (backfill outcomes for runners ≥ `OUTCOME_LAG_DAYS` old).
+- Runs against this checkout's `.env` and `data/bstalk3r.db`; logs to `logs/`.
+- Once enough data has accumulated, `bstalk3r replay --sweep-min-rvol …` turns it
+  into parameter decisions.
+
+When you move to a paid intraday Polygon plan, add a market-hours `bstalk3r run`
+agent for live (paper) dry-run entries; the schedule template is the model.
+
+---
+
 ## Development
 
 ```bash
