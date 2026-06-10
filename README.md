@@ -128,16 +128,43 @@ No reliable **free** source provides share float, so `float_shares` /
 
 ---
 
+## Universe source (watchlist vs Polygon screener)
+
+`UNIVERSE_SOURCE` picks where candidates come from:
+
+| Mode | What it does | Data | Cost |
+|---|---|---|---|
+| `watchlist` | Evaluates the fixed `UNIVERSE` list via Alpaca/IEX | intraday | free |
+| `polygon` + `POLYGON_INTRADAY=false` | Screens the **whole US market** for the **prior session's** runners via Polygon grouped daily bars (one call, ~12k tickers, cached per day) | **end-of-day** | **free** |
+| `polygon` + `POLYGON_INTRADAY=true` | Screens **intraday** top gainers via Polygon's snapshot endpoint | intraday (15-min delayed) | **paid** (Stocks Starter+) |
+
+**Free Polygon = EOD discovery.** The free tier returns `403` on the intraday
+snapshot endpoint, so grouped mode surfaces *yesterday's* runners — a research /
+next-day watchlist. Grouped bars carry no intraday quote or per-minute volume,
+so `volume_acceleration=1.0` and `spread_pct=0`, and the strict entry filter
+(RVOL≥8 **and** vol-accel≥3) stays at zero by design — intraday entries need the
+intraday feed. Example free-tier `scan`:
+
+```
+Screened 50 symbols via polygon -> 0 entry-ready candidate(s).
+Top screened runners:
+  [ ] CCTG   $  1.78  chg= 271.5%  rvol=  3.7  vacc=1.0  spread=0.00%
+  [ ] RGNT   $  2.41  chg=  88.3%  rvol=  9.2  vacc=1.0  spread=0.00%
+  ...
+```
+
+To trade these intraday, upgrade Polygon and flip `POLYGON_INTRADAY=true` — no
+code change. Both paths implement `SnapshotSource` in `src/sources.py`.
+
 ## Data feed limitations (free / IEX)
 
-The free Alpaca feed is **IEX**, which cannot screen the whole market and is
-thinner than SIP. Consequences for v0:
+The free Alpaca feed is **IEX**, used for `watchlist` metrics and for pricing
+held positions during exits. Consequences for v0:
 
-- The scanner evaluates a configured **watchlist** (`UNIVERSE` in `.env`), not
-  the entire market. Plug in a real screener (Polygon/Finnhub) via
-  `MarketDataProvider` to widen it.
-- `RVOL` here = today's cumulative volume ÷ 20-day average daily volume; it
-  **understates** RVOL early in the session. Good enough as a momentum proxy.
+- IEX cannot screen the whole market (hence the Polygon screener above for
+  discovery) and is thinner than SIP.
+- `RVOL` (watchlist mode) = today's cumulative volume ÷ 20-day average daily
+  volume; it **understates** RVOL early in the session. Good enough as a proxy.
 - Set `DATA_FEED=sip` only if your account is subscribed to SIP.
 
 ---
