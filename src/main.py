@@ -49,6 +49,34 @@ def _today() -> str:
     return datetime.now(UTC).date().isoformat()
 
 
+def _git_commit() -> str | None:
+    import subprocess
+    from pathlib import Path
+
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        return out.stdout.strip() or None
+    except Exception:  # noqa: BLE001 — provenance is best-effort
+        return None
+
+
+def _start_run(settings: Settings, db: Database, mode: str) -> int:
+    """Open a provenance run stamping the exact param set + code commit."""
+    return db.start_run(
+        settings.param_snapshot(),
+        mode=mode,
+        universe_source=settings.universe_source,
+        dry_run=settings.dry_run,
+        git_commit=_git_commit(),
+    )
+
+
 def _near_market_close(settings: Settings, now_et: datetime | None = None) -> bool:
     """True within force_close_before_close_minutes of 16:00 ET (or after)."""
     now_et = now_et or datetime.now(_ET)
@@ -83,9 +111,14 @@ def cmd_check(settings: Settings) -> int:
 
 def cmd_scan(settings: Settings, source: SnapshotSource, db: Database) -> int:
     settings.validate_paper_safety()
+    run_id = _start_run(settings, db, mode="scan")
     filters = settings.build_scan_filters()
     snapshots = source.fetch()
     candidates = scan_candidates(snapshots, filters)
+    # Accumulate the full screened universe (not just entry-ready) for research.
+    db.record_screened(
+        snapshots, settings.universe_source, {c.symbol for c in candidates}, run_id=run_id
+    )
 
     for c in candidates:
         entry = evaluate_entry(c, settings.build_entry_params(), holding=False)
@@ -98,6 +131,7 @@ def cmd_scan(settings: Settings, source: SnapshotSource, db: Database) -> int:
             spread_pct=c.spread_pct,
             score=entry.score,
             reason=entry.reasons,
+            run_id=run_id,
         )
     print(
         f"Screened {len(snapshots)} symbols via {settings.universe_source} "
@@ -137,14 +171,17 @@ def cmd_run(
     once: bool = False,
 ) -> int:
     settings.validate_paper_safety()
+    run_id = _start_run(settings, db, mode="run")
     entry_params: EntryParams = settings.build_entry_params()
     exit_params: ExitParams = settings.build_exit_params()
     risk_params: RiskParams = settings.build_risk_params()
     filters = settings.build_scan_filters()
-    engine = ExecutionEngine(trading, db, settings.build_exec_params(), settings.dry_run, log)
+    engine = ExecutionEngine(
+        trading, db, settings.build_exec_params(), settings.dry_run, log, run_id=run_id
+    )
 
     peak: dict[str, float] = {}
-    log.info("loop_start", dry_run=settings.dry_run, source=settings.universe_source)
+    log.info("loop_start", dry_run=settings.dry_run, source=settings.universe_source, run_id=run_id)
 
     try:
         while True:
@@ -160,6 +197,7 @@ def cmd_run(
                 risk_params,
                 filters,
                 peak,
+                run_id,
             )
             if once:
                 break
@@ -182,6 +220,7 @@ def _tick(
     risk_params,
     filters,
     peak,
+    run_id=None,
 ) -> None:
     try:
         snapshots = source.fetch()
@@ -194,6 +233,13 @@ def _tick(
     open_positions = db.get_open_positions()
     open_symbols = {p["symbol"] for p in open_positions}
     force_close = _near_market_close(settings)
+
+    # Accumulate the full screened universe every tick (idempotent per session).
+    candidates = scan_candidates(snapshots, filters)
+    if snapshots:
+        db.record_screened(
+            snapshots, settings.universe_source, {c.symbol for c in candidates}, run_id=run_id
+        )
 
     # Held symbols may have dropped out of the screened set — look them up
     # directly so exits are still managed on current price.
@@ -248,7 +294,7 @@ def _tick(
         data_healthy=data_healthy,
     )
 
-    for cand in scan_candidates(snapshots, filters):
+    for cand in candidates:
         if cand.symbol in open_symbols:
             continue
         entry = evaluate_entry(cand, entry_params, holding=False)
@@ -261,6 +307,7 @@ def _tick(
             spread_pct=cand.spread_pct,
             score=entry.score,
             reason=entry.reasons,
+            run_id=run_id,
         )
         if not entry.enter:
             continue
@@ -272,7 +319,7 @@ def _tick(
         if qty <= 0:
             continue
         engine.submit_entry(cand, qty, signal_id=sid)
-        db.insert_position(cand.symbol, datetime.now(UTC), cand.last_price, qty)
+        db.insert_position(cand.symbol, datetime.now(UTC), cand.last_price, qty, run_id=run_id)
         open_symbols.add(cand.symbol)
         risk_state = RiskState(
             account_equity=equity,

@@ -21,6 +21,7 @@ class Reporter:
 
     def build_report(self, date: str) -> dict[str, Any]:
         num_signals = self.db.count_signals(date)
+        num_screened = self.db.count_screened(date)
         closed = self.db.get_closed_positions(date)
         num_trades = len(closed)
 
@@ -31,6 +32,7 @@ class Reporter:
 
         return {
             "date": date,
+            "num_screened": num_screened,
             "num_signals": num_signals,
             "num_trades": num_trades,
             "win_rate": win_rate,
@@ -86,6 +88,7 @@ def _render_markdown(r: dict[str, Any]) -> str:
     lines = [
         f"# BStalk3r daily report — {r['date']}",
         "",
+        f"- Screened runners: **{r['num_screened']}**",
         f"- Signals: **{r['num_signals']}**",
         f"- Trades: **{r['num_trades']}**",
         f"- Win rate: **{r['win_rate'] * 100:.1f}%**",

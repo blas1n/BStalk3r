@@ -147,6 +147,24 @@ def test_unhealthy_data_blocks_entry(tmp_path, monkeypatch):
     assert db.get_open_positions() == []
 
 
+def test_tick_accumulates_screened_universe(tmp_path, monkeypatch):
+    from datetime import UTC, datetime
+
+    settings = _settings(tmp_path)
+    db = Database(settings.db_path)
+    db.init_schema()
+    runner = make_snapshot(symbol="RUNR")  # entry-ready
+    dud = make_snapshot(symbol="DUD", rvol=1.0)  # screened, not entry-ready
+
+    _run_tick(settings, db, [runner, dud], monkeypatch)
+
+    today = datetime.now(UTC).date().isoformat()
+    rows = {r["symbol"]: r for r in db.get_screened(today)}
+    assert set(rows) == {"RUNR", "DUD"}  # full universe persisted, not just entry-ready
+    assert rows["RUNR"]["entry_ready"] == 1
+    assert rows["DUD"]["entry_ready"] == 0
+
+
 def test_build_source_polygon_grouped_is_default(tmp_path):
     settings = _settings(tmp_path, universe_source="polygon", polygon_api_key="key")
     src = main_mod._build_source(settings, market=None)

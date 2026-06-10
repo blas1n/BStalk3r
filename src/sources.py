@@ -159,7 +159,9 @@ class PolygonGroupedSource:
             return []
         prev_rows = self._session_before(today_date)
         prev_by_symbol = {r["T"]: r for r in prev_rows if r.get("T")}
-        return polygon_grouped_to_snapshots(today_rows, prev_by_symbol, self._bounds, self._top_n)
+        return polygon_grouped_to_snapshots(
+            today_rows, prev_by_symbol, self._bounds, self._top_n, session_date=today_date
+        )
 
     def _latest_session_with_data(self) -> tuple[str, list[dict[str, Any]]]:
         day = datetime.now(_ET).date()
@@ -204,11 +206,15 @@ def polygon_grouped_to_snapshots(
     prev_by_symbol: dict[str, dict[str, Any]],
     bounds: ScreenBounds,
     top_n: int = 50,
+    session_date: str | None = None,
 ) -> list[MarketSnapshot]:
     """Map grouped daily bars to runner snapshots (day change vs prior close).
 
     No intraday quote/minute data in this feed -> spread_pct=0, vol_accel=1.
+    `session_date` (YYYY-MM-DD) stamps each snapshot's timestamp so the data is
+    accumulated under the *trading date it represents*, not the capture day.
     """
+    stamp = datetime.fromisoformat(session_date) if session_date else None
     out: list[MarketSnapshot] = []
     for row in today_rows:
         symbol = row.get("T")
@@ -238,6 +244,7 @@ def polygon_grouped_to_snapshots(
                 ask_price=None,
                 float_shares=None,
                 market_cap=None,
+                timestamp=stamp,
             )
         )
     out.sort(key=lambda s: s.day_change_pct, reverse=True)

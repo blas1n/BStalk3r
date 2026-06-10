@@ -185,10 +185,24 @@ A `.devcontainer/` is provided for a reproducible Python 3.11 environment.
 
 ## SQLite schema
 
-`signals`, `orders`, `positions`, `daily_stats` — the full audit trail. Inspect
-with any SQLite client:
+`param_sets`, `runs`, `screened`, `signals`, `orders`, `positions`,
+`daily_stats` — the full audit trail, built so the data supports **retrospection
+of parameters/strategy**, not just record-keeping:
+
+- **`screened`** — longitudinal research dataset: **every** screened runner (not
+  just entry-ready ones) upserted per `(session_date, symbol, source)`, stamped
+  with the trading date the data represents.
+- **`runs` + `param_sets`** — provenance. Every run records the exact parameter
+  set (hashed, deduped) + git commit; every signal/order/position/screened row
+  carries `run_id`. So you can group outcomes by parameter set and answer "which
+  thresholds produced this?" after changing them. (Forward-return outcomes +
+  offline replay are the next lifts — see
+  `~/Docs/BStalk3r/Retrospection_Data_Model_2026-06-10.md`.)
+
+Inspect with any SQLite client:
 
 ```bash
 sqlite3 data/bstalk3r.db ".tables"
+sqlite3 data/bstalk3r.db "SELECT session_date, symbol, day_change_pct, rvol, entry_ready FROM screened ORDER BY session_date DESC, day_change_pct DESC LIMIT 20;"
 sqlite3 data/bstalk3r.db "SELECT symbol, status, limit_price FROM orders ORDER BY id DESC LIMIT 10;"
 ```
