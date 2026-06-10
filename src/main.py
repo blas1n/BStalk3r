@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import structlog
@@ -18,8 +18,10 @@ from src.alpaca_client import AlpacaTradingClient
 from src.config import Settings, load_settings
 from src.database import Database
 from src.execution import ExecutionEngine
+from src.forward_bars import ForwardBarsProvider, PolygonDailyBars
 from src.market_data import AlpacaMarketData, MarketDataProvider
 from src.models import PositionState
+from src.outcomes import compute_outcomes
 from src.risk import RiskParams, RiskState, check_entry_allowed, position_size
 from src.scanner import scan_candidates
 from src.sources import (
@@ -159,6 +161,51 @@ def cmd_report(settings: Settings, db: Database, date: str | None) -> int:
     paths = Reporter(db, settings.report_dir).write_report(date)
     print(f"📊 Report written: {paths['markdown']}")
     print(paths["markdown"].read_text())
+    return 0
+
+
+def _forward_window(session_date: str, span_days: int = 10) -> tuple[str, str]:
+    """Calendar range covering the trading days after `session_date`."""
+    base = datetime.fromisoformat(session_date).date()
+    return (base + timedelta(days=1)).isoformat(), (base + timedelta(days=span_days)).isoformat()
+
+
+def cmd_track(
+    settings: Settings,
+    db: Database,
+    bars: ForwardBarsProvider,
+    before_date: str | None = None,
+    throttle_sec: int | None = None,
+    limit: int | None = None,
+) -> int:
+    """Backfill forward outcomes for screened runners old enough to have data."""
+    settings.validate_paper_safety()
+    cutoff = (
+        before_date
+        or (datetime.now(UTC).date() - timedelta(days=settings.outcome_lag_days)).isoformat()
+    )
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+
+    pending = db.get_screened_pending_outcomes(cutoff)
+    if limit:
+        pending = pending[:limit]
+
+    written = 0
+    for i, row in enumerate(pending):
+        start, end = _forward_window(row["session_date"])
+        fwd = bars.fetch(row["symbol"], start, end)
+        for o in compute_outcomes(row["last_price"], fwd, horizons=(1, 3, 5)):
+            db.upsert_outcome(
+                screened_id=row["id"], symbol=row["symbol"], base_date=row["session_date"], **o
+            )
+            written += 1
+        if throttle and i < len(pending) - 1:
+            time.sleep(throttle)
+
+    print(
+        f"Tracked {len(pending)} pending runner(s) (cutoff {cutoff}); "
+        f"wrote {written} outcome(s). Total outcomes: {db.count_outcomes()}"
+    )
     return 0
 
 
@@ -382,6 +429,9 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--once", action="store_true", help="single tick then exit")
     p_report = sub.add_parser("report", help="write end-of-day report")
     p_report.add_argument("--date", help="YYYY-MM-DD (default: today UTC)")
+    p_track = sub.add_parser("track", help="backfill forward outcomes for screened runners")
+    p_track.add_argument("--before", help="only track runners on/before this date (YYYY-MM-DD)")
+    p_track.add_argument("--limit", type=int, help="max runners to process this run")
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -397,6 +447,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "check":
         return cmd_check(settings)
+
+    if args.command == "track":
+        try:
+            bars = PolygonDailyBars(settings.polygon_api_key)
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_track(settings, db, bars, before_date=args.before, limit=args.limit)
 
     market = AlpacaMarketData(
         settings.alpaca_api_key, settings.alpaca_secret_key, settings.data_feed

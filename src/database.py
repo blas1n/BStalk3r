@@ -94,6 +94,21 @@ CREATE TABLE IF NOT EXISTS screened (
     UNIQUE(session_date, symbol, source)
 );
 
+CREATE TABLE IF NOT EXISTS outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    screened_id INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    base_date TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    ref_price REAL,
+    fwd_price REAL,
+    fwd_return_pct REAL,
+    max_gain_pct REAL,
+    max_drawdown_pct REAL,
+    computed_at TEXT NOT NULL,
+    UNIQUE(screened_id, horizon)
+);
+
 CREATE TABLE IF NOT EXISTS daily_stats (
     date TEXT PRIMARY KEY,
     num_signals INTEGER,
@@ -360,6 +375,80 @@ class Database:
     def get_daily_stats(self, date: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM daily_stats WHERE date=?", (date,)).fetchone()
         return dict(row) if row else None
+
+    # ---- outcomes (forward returns on screened runners) ----
+    def upsert_outcome(
+        self,
+        screened_id: int,
+        symbol: str,
+        base_date: str,
+        horizon: str,
+        ref_price: float,
+        fwd_price: float,
+        fwd_return_pct: float,
+        max_gain_pct: float,
+        max_drawdown_pct: float,
+    ) -> None:
+        self.conn.execute(
+            """INSERT INTO outcomes
+               (screened_id, symbol, base_date, horizon, ref_price, fwd_price,
+                fwd_return_pct, max_gain_pct, max_drawdown_pct, computed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(screened_id, horizon) DO UPDATE SET
+                 ref_price=excluded.ref_price,
+                 fwd_price=excluded.fwd_price,
+                 fwd_return_pct=excluded.fwd_return_pct,
+                 max_gain_pct=excluded.max_gain_pct,
+                 max_drawdown_pct=excluded.max_drawdown_pct,
+                 computed_at=excluded.computed_at""",
+            (
+                screened_id,
+                symbol,
+                base_date,
+                horizon,
+                ref_price,
+                fwd_price,
+                fwd_return_pct,
+                max_gain_pct,
+                max_drawdown_pct,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        self.conn.commit()
+
+    def count_outcomes(self) -> int:
+        return int(self.conn.execute("SELECT COUNT(*) c FROM outcomes").fetchone()["c"])
+
+    def get_outcomes(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        if symbol:
+            rows = self.conn.execute(
+                "SELECT * FROM outcomes WHERE symbol=? ORDER BY base_date, horizon", (symbol,)
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM outcomes ORDER BY base_date, symbol, horizon"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_screened_pending_outcomes(
+        self, before_date: str, final_horizon: str = "5d"
+    ) -> list[dict[str, Any]]:
+        """Screened rows old enough to track that still lack the final horizon.
+
+        `before_date` is the newest session to consider (caller passes today minus
+        the free-tier lag). Re-running fills shorter horizons as data appears.
+        """
+        rows = self.conn.execute(
+            """SELECT s.* FROM screened s
+               WHERE s.session_date <= ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM outcomes o
+                   WHERE o.screened_id = s.id AND o.horizon = ?
+                 )
+               ORDER BY s.session_date, s.symbol""",
+            (before_date, final_horizon),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # ---- screened (longitudinal runner dataset) ----
     def record_screened(

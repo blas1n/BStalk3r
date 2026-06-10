@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     # (intraday, requires a paid Polygon plan).
     polygon_intraday: bool = False
 
+    # Outcome tracking: only track runners at least this many days old (free-tier
+    # forward bars lag), and throttle Polygon calls (5 req/min limit).
+    outcome_lag_days: int = 8
+    outcome_throttle_sec: int = 13
+
     # ---- scanner ----
     min_price: float = 1.0
     max_price: float = 50.0
