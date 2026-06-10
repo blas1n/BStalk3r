@@ -80,6 +80,10 @@ uv run bstalk3r run --once     # single tick then exit (handy for testing)
 # 6. end-of-day report (markdown + json under reports/)
 uv run bstalk3r report                 # today (UTC)
 uv run bstalk3r report --date 2026-06-10
+
+# 7. backfill forward outcomes on screened runners (research fuel)
+uv run bstalk3r track                   # runners >= OUTCOME_LAG_DAYS old
+uv run bstalk3r track --before 2026-06-01 --limit 50
 ```
 
 ### Getting Alpaca paper keys
@@ -185,7 +189,7 @@ A `.devcontainer/` is provided for a reproducible Python 3.11 environment.
 
 ## SQLite schema
 
-`param_sets`, `runs`, `screened`, `signals`, `orders`, `positions`,
+`param_sets`, `runs`, `screened`, `outcomes`, `signals`, `orders`, `positions`,
 `daily_stats` — the full audit trail, built so the data supports **retrospection
 of parameters/strategy**, not just record-keeping:
 
@@ -195,9 +199,16 @@ of parameters/strategy**, not just record-keeping:
 - **`runs` + `param_sets`** — provenance. Every run records the exact parameter
   set (hashed, deduped) + git commit; every signal/order/position/screened row
   carries `run_id`. So you can group outcomes by parameter set and answer "which
-  thresholds produced this?" after changing them. (Forward-return outcomes +
-  offline replay are the next lifts — see
-  `~/Docs/BStalk3r/Retrospection_Data_Model_2026-06-10.md`.)
+  thresholds produced this?" after changing them.
+- **`outcomes`** — forward results per screened runner: `bstalk3r track` fetches
+  the following sessions' daily bars (Polygon, free historical) and records
+  +1d/+3d/+5d return, max gain, and max drawdown vs the runner's close. This is
+  the *fuel* for judging whether a parameter set would have caught the winners.
+  Free-tier bars lag, so `track` only processes runners ≥ `OUTCOME_LAG_DAYS` old
+  and backfills as data appears (idempotent).
+
+Offline replay over this data is the next lift — see
+`~/Docs/BStalk3r/Retrospection_Data_Model_2026-06-10.md`.
 
 Inspect with any SQLite client:
 
