@@ -450,6 +450,40 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_screened_with_outcomes(
+        self,
+        horizon: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        source: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Screened runners joined to their forward outcome at `horizon`.
+
+        `ret` / `max_gain` / `max_drawdown` are NULL when the outcome isn't
+        computed yet. This is the replay harness's input.
+        """
+        sql = """
+            SELECT s.*,
+                   o.fwd_return_pct AS ret,
+                   o.max_gain_pct AS max_gain,
+                   o.max_drawdown_pct AS max_drawdown
+            FROM screened s
+            LEFT JOIN outcomes o ON o.screened_id = s.id AND o.horizon = ?
+            WHERE 1=1
+        """
+        params: list[Any] = [horizon]
+        if start_date:
+            sql += " AND s.session_date >= ?"
+            params.append(start_date)
+        if end_date:
+            sql += " AND s.session_date <= ?"
+            params.append(end_date)
+        if source:
+            sql += " AND s.source = ?"
+            params.append(source)
+        sql += " ORDER BY s.session_date, s.symbol"
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
     # ---- screened (longitudinal runner dataset) ----
     def record_screened(
         self,

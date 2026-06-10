@@ -84,6 +84,10 @@ uv run bstalk3r report --date 2026-06-10
 # 7. backfill forward outcomes on screened runners (research fuel)
 uv run bstalk3r track                   # runners >= OUTCOME_LAG_DAYS old
 uv run bstalk3r track --before 2026-06-01 --limit 50
+
+# 8. replay alternate parameters over the accumulated data (retrospection)
+uv run bstalk3r replay --horizon 3d
+uv run bstalk3r replay --horizon 3d --sweep-min-rvol 4,8,12,16
 ```
 
 ### Getting Alpaca paper keys
@@ -207,7 +211,25 @@ of parameters/strategy**, not just record-keeping:
   Free-tier bars lag, so `track` only processes runners ≥ `OUTCOME_LAG_DAYS` old
   and backfills as data appears (idempotent).
 
-Offline replay over this data is the next lift — see
+**Replay (retrospection).** `bstalk3r replay` re-simulates alternate parameter
+sets over the accumulated `screened` + `outcomes` data — reusing the *live*
+`scanner.passes_filters`, so it can never drift from real entry logic. It reports,
+per variant, how many runners would have been entered and how that set actually
+did (avg / median forward return, win rate, avg max gain, avg max drawdown).
+Sweep a threshold to compare:
+
+```
+$ bstalk3r replay --horizon 3d --sweep-min-rvol 8,12,18
+Replay over 5 screened runner(s) @ horizon 3d
+  variant           enter    score     avg%     med%     win%   maxgn%     mdd%
+  baseline              1        1     14.0     14.0    100.0     16.3     -1.0
+  rvol>=12              1        1     14.0     14.0    100.0     16.3     -1.0
+  rvol>=18              0        0        —        —        —        —        —
+```
+
+Replay gates on the fields EOD data has (price / day-change / rvol) and leaves
+the intraday-only gates (vol-accel / spread) permissive; once intraday data is
+accumulated (paid Polygon), those become sweepable too. Design notes:
 `~/Docs/BStalk3r/Retrospection_Data_Model_2026-06-10.md`.
 
 Inspect with any SQLite client:
