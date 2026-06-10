@@ -86,6 +86,8 @@ def cmd_scan(settings: Settings, source: SnapshotSource, db: Database) -> int:
     filters = settings.build_scan_filters()
     snapshots = source.fetch()
     candidates = scan_candidates(snapshots, filters)
+    # Accumulate the full screened universe (not just entry-ready) for research.
+    db.record_screened(snapshots, settings.universe_source, {c.symbol for c in candidates})
 
     for c in candidates:
         entry = evaluate_entry(c, settings.build_entry_params(), holding=False)
@@ -195,6 +197,11 @@ def _tick(
     open_symbols = {p["symbol"] for p in open_positions}
     force_close = _near_market_close(settings)
 
+    # Accumulate the full screened universe every tick (idempotent per session).
+    candidates = scan_candidates(snapshots, filters)
+    if snapshots:
+        db.record_screened(snapshots, settings.universe_source, {c.symbol for c in candidates})
+
     # Held symbols may have dropped out of the screened set — look them up
     # directly so exits are still managed on current price.
     missing = [p["symbol"] for p in open_positions if p["symbol"] not in by_symbol]
@@ -248,7 +255,7 @@ def _tick(
         data_healthy=data_healthy,
     )
 
-    for cand in scan_candidates(snapshots, filters):
+    for cand in candidates:
         if cand.symbol in open_symbols:
             continue
         entry = evaluate_entry(cand, entry_params, holding=False)

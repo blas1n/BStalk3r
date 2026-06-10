@@ -56,6 +56,21 @@ CREATE TABLE IF NOT EXISTS positions (
     exit_reason TEXT
 );
 
+CREATE TABLE IF NOT EXISTS screened (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    screened_at TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    source TEXT NOT NULL,
+    last_price REAL,
+    day_change_pct REAL,
+    rvol REAL,
+    volume_acceleration REAL,
+    spread_pct REAL,
+    entry_ready INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(session_date, symbol, source)
+);
+
 CREATE TABLE IF NOT EXISTS daily_stats (
     date TEXT PRIMARY KEY,
     num_signals INTEGER,
@@ -262,3 +277,64 @@ class Database:
     def get_daily_stats(self, date: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT * FROM daily_stats WHERE date=?", (date,)).fetchone()
         return dict(row) if row else None
+
+    # ---- screened (longitudinal runner dataset) ----
+    def record_screened(
+        self,
+        snapshots: list[Any],
+        source: str,
+        entry_ready: set[str] | None = None,
+    ) -> int:
+        """Persist every screened runner, idempotent per (session_date, symbol, source).
+
+        session_date comes from each snapshot's timestamp (the trading date the
+        data represents) so a Monday capture of Friday's runners files correctly.
+        """
+        ready = entry_ready or set()
+        count = 0
+        for s in snapshots:
+            ts = s.timestamp or datetime.now(UTC)
+            self.conn.execute(
+                """INSERT INTO screened
+                   (screened_at, session_date, symbol, source, last_price,
+                    day_change_pct, rvol, volume_acceleration, spread_pct, entry_ready)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(session_date, symbol, source) DO UPDATE SET
+                     screened_at=excluded.screened_at,
+                     last_price=excluded.last_price,
+                     day_change_pct=excluded.day_change_pct,
+                     rvol=excluded.rvol,
+                     volume_acceleration=excluded.volume_acceleration,
+                     spread_pct=excluded.spread_pct,
+                     entry_ready=excluded.entry_ready""",
+                (
+                    datetime.now(UTC).isoformat(),
+                    ts.date().isoformat(),
+                    s.symbol,
+                    source,
+                    s.last_price,
+                    s.day_change_pct,
+                    s.rvol,
+                    s.volume_acceleration,
+                    s.spread_pct,
+                    1 if s.symbol in ready else 0,
+                ),
+            )
+            count += 1
+        self.conn.commit()
+        return count
+
+    def count_screened(self, date: str | None = None) -> int:
+        if date:
+            row = self.conn.execute(
+                "SELECT COUNT(*) c FROM screened WHERE session_date=?", (date,)
+            ).fetchone()
+        else:
+            row = self.conn.execute("SELECT COUNT(*) c FROM screened").fetchone()
+        return int(row["c"])
+
+    def get_screened(self, date: str) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM screened WHERE session_date=? ORDER BY day_change_pct DESC", (date,)
+        ).fetchall()
+        return [dict(r) for r in rows]

@@ -145,11 +145,20 @@ def test_grouped_top_n():
     assert len(polygon_grouped_to_snapshots(TODAY, PREV, BOUNDS, top_n=1)) == 1
 
 
+def test_grouped_stamps_session_date():
+    snaps = polygon_grouped_to_snapshots(TODAY, PREV, BOUNDS, session_date="2026-06-09")
+    assert all(s.timestamp is not None for s in snaps)
+    assert snaps[0].timestamp.date().isoformat() == "2026-06-09"
+
+
 def test_grouped_source_fetch_wires_two_sessions(monkeypatch):
     src = PolygonGroupedSource(api_key="k", bounds=BOUNDS, top_n=50)
     monkeypatch.setattr(src, "_latest_session_with_data", lambda: ("2026-06-09", TODAY))
     monkeypatch.setattr(src, "_session_before", lambda d: list(PREV.values()))
-    assert [s.symbol for s in src.fetch()] == ["BLAZ", "RUNR"]
+    out = src.fetch()
+    assert [s.symbol for s in out] == ["BLAZ", "RUNR"]
+    # source stamps the data's session date for durable accumulation
+    assert out[0].timestamp.date().isoformat() == "2026-06-09"
 
 
 def test_grouped_source_requires_key():
