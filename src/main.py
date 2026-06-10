@@ -22,6 +22,13 @@ from src.market_data import AlpacaMarketData, MarketDataProvider
 from src.models import PositionState
 from src.risk import RiskParams, RiskState, check_entry_allowed, position_size
 from src.scanner import scan_candidates
+from src.sources import (
+    PolygonGainersSource,
+    PolygonGroupedSource,
+    ScreenBounds,
+    SnapshotSource,
+    WatchlistSource,
+)
 from src.strategy import EntryParams, ExitParams, evaluate_entry, evaluate_exit
 
 _ET = ZoneInfo("America/New_York")
@@ -74,11 +81,10 @@ def cmd_check(settings: Settings) -> int:
     return 0
 
 
-def cmd_scan(settings: Settings, market: MarketDataProvider, db: Database) -> int:
+def cmd_scan(settings: Settings, source: SnapshotSource, db: Database) -> int:
     settings.validate_paper_safety()
     filters = settings.build_scan_filters()
-    symbols = settings.universe_symbols()
-    snapshots = market.get_snapshots(symbols)
+    snapshots = source.fetch()
     candidates = scan_candidates(snapshots, filters)
 
     for c in candidates:
@@ -93,12 +99,21 @@ def cmd_scan(settings: Settings, market: MarketDataProvider, db: Database) -> in
             score=entry.score,
             reason=entry.reasons,
         )
-    print(f"Scanned {len(symbols)} symbols -> {len(candidates)} candidate(s):")
-    for c in candidates:
+    print(
+        f"Screened {len(snapshots)} symbols via {settings.universe_source} "
+        f"-> {len(candidates)} entry-ready candidate(s)."
+    )
+    # Always surface the top of the screen (useful in EOD/discovery mode where
+    # intraday-only fields keep the strict entry filter at zero).
+    top = sorted(snapshots, key=lambda s: s.day_change_pct, reverse=True)[:15]
+    if top:
+        print("Top screened runners:")
+    for s in top:
+        ready = "✓" if s in candidates else " "
         print(
-            f"  {c.symbol:6s} ${c.last_price:7.2f}  "
-            f"chg={c.day_change_pct:5.1f}%  rvol={c.rvol:5.1f}  "
-            f"vacc={c.volume_acceleration:4.1f}  spread={c.spread_pct:.2f}%"
+            f"  [{ready}] {s.symbol:6s} ${s.last_price:8.2f}  "
+            f"chg={s.day_change_pct:6.1f}%  rvol={s.rvol:6.1f}  "
+            f"vacc={s.volume_acceleration:4.1f}  spread={s.spread_pct:.2f}%"
         )
     return 0
 
@@ -115,6 +130,7 @@ def cmd_report(settings: Settings, db: Database, date: str | None) -> int:
 
 def cmd_run(
     settings: Settings,
+    source: SnapshotSource,
     market: MarketDataProvider,
     db: Database,
     trading: AlpacaTradingClient | None,
@@ -128,12 +144,13 @@ def cmd_run(
     engine = ExecutionEngine(trading, db, settings.build_exec_params(), settings.dry_run, log)
 
     peak: dict[str, float] = {}
-    log.info("loop_start", dry_run=settings.dry_run, universe=settings.universe_symbols())
+    log.info("loop_start", dry_run=settings.dry_run, source=settings.universe_source)
 
     try:
         while True:
             _tick(
                 settings,
+                source,
                 market,
                 db,
                 engine,
@@ -154,11 +171,20 @@ def cmd_run(
 
 
 def _tick(
-    settings, market, db, engine, trading, entry_params, exit_params, risk_params, filters, peak
+    settings,
+    source,
+    market,
+    db,
+    engine,
+    trading,
+    entry_params,
+    exit_params,
+    risk_params,
+    filters,
+    peak,
 ) -> None:
-    symbols = settings.universe_symbols()
     try:
-        snapshots = market.get_snapshots(symbols)
+        snapshots = source.fetch()
         data_healthy = len(snapshots) > 0
     except Exception as exc:  # noqa: BLE001 — data outage must halt entries, not crash
         log.warning("market_data_error", error=str(exc))
@@ -168,6 +194,16 @@ def _tick(
     open_positions = db.get_open_positions()
     open_symbols = {p["symbol"] for p in open_positions}
     force_close = _near_market_close(settings)
+
+    # Held symbols may have dropped out of the screened set — look them up
+    # directly so exits are still managed on current price.
+    missing = [p["symbol"] for p in open_positions if p["symbol"] not in by_symbol]
+    if missing:
+        try:
+            for s in market.get_snapshots(missing):
+                by_symbol[s.symbol] = s
+        except Exception as exc:  # noqa: BLE001
+            log.warning("held_lookup_error", error=str(exc))
 
     # ---- manage exits first ----
     for pos in open_positions:
@@ -260,6 +296,19 @@ def _force_close_all(market, db, engine, exit_params, peak) -> None:
         db.close_position(pos["id"], datetime.now(UTC), price, pnl_pct, pnl_amount, "force_close")
 
 
+def _build_source(settings: Settings, market: MarketDataProvider) -> SnapshotSource:
+    if settings.universe_source.lower() == "polygon":
+        if settings.polygon_intraday:
+            return PolygonGainersSource(settings.polygon_api_key, settings.screener_top_n)
+        bounds = ScreenBounds(
+            min_price=settings.min_price,
+            max_price=settings.max_price,
+            min_change_pct=settings.min_day_change_pct,
+        )
+        return PolygonGroupedSource(settings.polygon_api_key, bounds, settings.screener_top_n)
+    return WatchlistSource(market, settings.universe_symbols())
+
+
 def _account_equity(trading: AlpacaTradingClient | None, settings: Settings) -> float:
     if trading is None:
         return settings.max_position_value * settings.max_concurrent_positions * 100
@@ -305,16 +354,21 @@ def main(argv: list[str] | None = None) -> int:
     market = AlpacaMarketData(
         settings.alpaca_api_key, settings.alpaca_secret_key, settings.data_feed
     )
+    try:
+        source = _build_source(settings, market)
+    except RuntimeError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 2
 
     if args.command == "scan":
-        return cmd_scan(settings, market, db)
+        return cmd_scan(settings, source, db)
     if args.command == "report":
         return cmd_report(settings, db, getattr(args, "date", None))
     if args.command == "run":
         trading = AlpacaTradingClient(
             settings.alpaca_api_key, settings.alpaca_secret_key, paper=True
         )
-        return cmd_run(settings, market, db, trading, once=args.once)
+        return cmd_run(settings, source, market, db, trading, once=args.once)
     return 1
 
 

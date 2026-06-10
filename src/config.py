@@ -32,7 +32,15 @@ class Settings(BaseSettings):
     dry_run: bool = True
     db_path: str = "data/bstalk3r.db"
     report_dir: str = "reports"
+
+    # universe source: "watchlist" | "polygon"
+    universe_source: str = "watchlist"
     universe: str = "AAPL,TSLA,NVDA,AMD,SOFI,PLTR"
+    polygon_api_key: str = ""
+    screener_top_n: int = 50
+    # False -> grouped daily bars (free tier, EOD). True -> snapshot gainers
+    # (intraday, requires a paid Polygon plan).
+    polygon_intraday: bool = False
 
     # ---- scanner ----
     min_price: float = 1.0
