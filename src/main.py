@@ -22,8 +22,9 @@ from src.forward_bars import ForwardBarsProvider, PolygonDailyBars
 from src.market_data import AlpacaMarketData, MarketDataProvider
 from src.models import PositionState
 from src.outcomes import compute_outcomes
+from src.replay import simulate
 from src.risk import RiskParams, RiskState, check_entry_allowed, position_size
-from src.scanner import scan_candidates
+from src.scanner import ScanFilters, scan_candidates
 from src.sources import (
     PolygonGainersSource,
     PolygonGroupedSource,
@@ -49,6 +50,12 @@ def _configure_logging() -> None:
 
 def _today() -> str:
     return datetime.now(UTC).date().isoformat()
+
+
+def _parse_floats(csv: str | None) -> list[float] | None:
+    if not csv:
+        return None
+    return [float(x) for x in csv.split(",") if x.strip()]
 
 
 def _git_commit() -> str | None:
@@ -207,6 +214,72 @@ def cmd_track(
         f"wrote {written} outcome(s). Total outcomes: {db.count_outcomes()}"
     )
     return 0
+
+
+def _replay_filters(
+    settings: Settings, min_rvol: float | None = None, min_day_change: float | None = None
+) -> ScanFilters:
+    """Filters for replay over EOD data: gate price/change/rvol, leave the
+    intraday-only fields (vol-accel/spread) permissive since EOD can't inform them.
+    """
+    return ScanFilters(
+        min_price=settings.min_price,
+        max_price=settings.max_price,
+        min_day_change_pct=settings.min_day_change_pct
+        if min_day_change is None
+        else min_day_change,
+        max_day_change_pct=settings.max_day_change_pct,
+        min_rvol=settings.min_rvol if min_rvol is None else min_rvol,
+        min_volume_acceleration=0.0,
+        max_spread_pct=1e9,
+    )
+
+
+def _build_variants(
+    settings: Settings,
+    sweep_rvol: list[float] | None,
+    sweep_change: list[float] | None,
+) -> list[tuple[str, ScanFilters]]:
+    variants: list[tuple[str, ScanFilters]] = [("baseline", _replay_filters(settings))]
+    for v in sweep_rvol or []:
+        variants.append((f"rvol>={v:g}", _replay_filters(settings, min_rvol=v)))
+    for v in sweep_change or []:
+        variants.append((f"chg>={v:g}%", _replay_filters(settings, min_day_change=v)))
+    return variants
+
+
+def cmd_replay(
+    settings: Settings,
+    db: Database,
+    horizon: str = "3d",
+    start: str | None = None,
+    end: str | None = None,
+    source: str | None = None,
+    sweep_rvol: list[float] | None = None,
+    sweep_change: list[float] | None = None,
+) -> int:
+    """Re-simulate alternate parameter sets over stored screened+outcome data."""
+    rows = db.get_screened_with_outcomes(horizon, start, end, source)
+    results = [
+        simulate(name, rows, f) for name, f in _build_variants(settings, sweep_rvol, sweep_change)
+    ]
+
+    span = f" [{start or '…'}..{end or '…'}]" if (start or end) else ""
+    print(f"Replay over {len(rows)} screened runner(s) @ horizon {horizon}{span}")
+    cols = ("variant", "enter", "score", "avg%", "med%", "win%", "maxgn%", "mdd%")
+    print("  " + " ".join(f"{c:>8s}" if c != "variant" else f"{c:14s}" for c in cols))
+    for r in results:
+        win = _fmt(r.win_rate * 100 if r.win_rate is not None else None)
+        print(
+            f"  {r.name:14s} {r.n_entered:>8d} {r.n_scored:>8d} "
+            f"{_fmt(r.avg_return)} {_fmt(r.median_return)} {win} "
+            f"{_fmt(r.avg_max_gain)} {_fmt(r.avg_max_drawdown)}"
+        )
+    return 0
+
+
+def _fmt(x: float | None, width: int = 8) -> str:
+    return f"{x:>{width}.1f}" if x is not None else f"{'—':>{width}}"
 
 
 def cmd_run(
@@ -432,6 +505,13 @@ def main(argv: list[str] | None = None) -> int:
     p_track = sub.add_parser("track", help="backfill forward outcomes for screened runners")
     p_track.add_argument("--before", help="only track runners on/before this date (YYYY-MM-DD)")
     p_track.add_argument("--limit", type=int, help="max runners to process this run")
+    p_replay = sub.add_parser("replay", help="re-simulate alternate params over stored data")
+    p_replay.add_argument("--horizon", default="3d", help="outcome horizon: 1d|3d|5d (default 3d)")
+    p_replay.add_argument("--start", help="earliest session_date (YYYY-MM-DD)")
+    p_replay.add_argument("--end", help="latest session_date (YYYY-MM-DD)")
+    p_replay.add_argument("--source", help="filter by screen source (polygon|watchlist)")
+    p_replay.add_argument("--sweep-min-rvol", help="comma-separated rvol thresholds, e.g. 4,8,12")
+    p_replay.add_argument("--sweep-min-day-change", help="comma-separated day-change %% thresholds")
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -455,6 +535,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"❌ {exc}", file=sys.stderr)
             return 2
         return cmd_track(settings, db, bars, before_date=args.before, limit=args.limit)
+
+    if args.command == "replay":
+        return cmd_replay(
+            settings,
+            db,
+            horizon=args.horizon,
+            start=args.start,
+            end=args.end,
+            source=args.source,
+            sweep_rvol=_parse_floats(args.sweep_min_rvol),
+            sweep_change=_parse_floats(args.sweep_min_day_change),
+        )
 
     market = AlpacaMarketData(
         settings.alpaca_api_key, settings.alpaca_secret_key, settings.data_feed
