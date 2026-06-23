@@ -192,9 +192,12 @@ def cmd_track(
         or (datetime.now(UTC).date() - timedelta(days=settings.outcome_lag_days)).isoformat()
     )
     throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+    if limit is None:
+        limit = settings.outcome_track_limit
 
     pending = db.get_screened_pending_outcomes(cutoff)
-    if limit:
+    total_pending = len(pending)
+    if limit and limit > 0:
         pending = pending[:limit]
 
     written = 0
@@ -209,9 +212,11 @@ def cmd_track(
         if throttle and i < len(pending) - 1:
             time.sleep(throttle)
 
+    remaining = total_pending - len(pending)
+    tail = f" ({remaining} still pending — drains over the next runs)" if remaining else ""
     print(
-        f"Tracked {len(pending)} pending runner(s) (cutoff {cutoff}); "
-        f"wrote {written} outcome(s). Total outcomes: {db.count_outcomes()}"
+        f"Processed {len(pending)}/{total_pending} pending runner(s) (cutoff {cutoff}); "
+        f"wrote {written} outcome(s). Total outcomes: {db.count_outcomes()}{tail}"
     )
     return 0
 

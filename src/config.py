@@ -43,9 +43,12 @@ class Settings(BaseSettings):
     polygon_intraday: bool = False
 
     # Outcome tracking: only track runners at least this many days old (free-tier
-    # forward bars lag), and throttle Polygon calls (5 req/min limit).
+    # forward bars lag), throttle Polygon calls (5 req/min limit), and bound how
+    # many runners one `track` run drains so a backlog spreads over days within
+    # the rate budget instead of bursting into 429s.
     outcome_lag_days: int = 8
     outcome_throttle_sec: int = 13
+    outcome_track_limit: int = 40
 
     # ---- scanner ----
     min_price: float = 1.0

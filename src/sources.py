@@ -11,15 +11,14 @@ decides *which* symbols are looked at and fills MarketSnapshot fields.
 
 from __future__ import annotations
 
-import json
 import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from src.models import MarketSnapshot
+from src.polygon_http import get_json
 
 POLYGON_GAINERS_URL = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers"
 POLYGON_GROUPED_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
@@ -62,8 +61,7 @@ class PolygonGainersSource:
 
     def _fetch_raw(self) -> dict[str, Any]:
         url = f"{POLYGON_GAINERS_URL}?apiKey={self._api_key}"
-        with urllib.request.urlopen(url, timeout=self._timeout) as resp:  # noqa: S310 — fixed https host
-            return json.loads(resp.read().decode())
+        return get_json(url, self._timeout)
 
 
 def polygon_gainers_to_snapshots(
@@ -193,8 +191,7 @@ class PolygonGroupedSource:
         # steps back to an older completed session.
         url = POLYGON_GROUPED_URL.format(date=date_iso) + f"?adjusted=true&apiKey={self._api_key}"
         try:
-            with urllib.request.urlopen(url, timeout=self._timeout) as resp:  # noqa: S310 — fixed https host
-                return json.loads(resp.read().decode())
+            return get_json(url, self._timeout)
         except urllib.error.HTTPError as exc:
             if exc.code in (403, 404):
                 return {}
