@@ -8,10 +8,10 @@ a 403/404 here is treated as "not available yet" (empty) and left pending.
 
 from __future__ import annotations
 
-import json
 import urllib.error
-import urllib.request
 from typing import Any, Protocol
+
+from src.polygon_http import get_json
 
 POLYGON_AGGS_URL = "https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{start}/{end}"
 
@@ -52,8 +52,7 @@ class PolygonDailyBars:
             + f"?adjusted=true&sort=asc&apiKey={self._api_key}"
         )
         try:
-            with urllib.request.urlopen(url, timeout=self._timeout) as resp:  # noqa: S310 — fixed https host
-                return polygon_aggs_to_bars(json.loads(resp.read().decode()))
+            return polygon_aggs_to_bars(get_json(url, self._timeout))
         except urllib.error.HTTPError as exc:
             if exc.code in (403, 404):
                 return []  # too recent / no data yet -> stay pending
