@@ -12,8 +12,9 @@ decides *which* symbols are looked at and fills MarketSnapshot fields.
 from __future__ import annotations
 
 import urllib.error
+from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,21 @@ POLYGON_GAINERS_URL = "https://api.polygon.io/v2/snapshot/locale/us/markets/stoc
 POLYGON_GROUPED_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
 _SESSION_MINUTES = 390  # 6.5h regular session, for the avg-minute-volume proxy
 _ET = ZoneInfo("America/New_York")
+
+
+def _weekdays_back(start: date, n: int) -> Iterator[date]:
+    """Up to `n` weekday dates from `start` going backward (skips Sat/Sun).
+
+    Weekends never have grouped data, so skipping them avoids wasted API calls
+    that still burn the free tier's 5 req/min budget and trigger 429s.
+    """
+    day = start
+    yielded = 0
+    while yielded < n:
+        if day.weekday() < 5:  # Mon=0 .. Fri=4
+            yield day
+            yielded += 1
+        day -= timedelta(days=1)
 
 
 class SnapshotSource(Protocol):
@@ -140,7 +156,7 @@ class PolygonGroupedSource:
         bounds: ScreenBounds,
         top_n: int = 50,
         timeout: int = 20,
-        max_lookback_days: int = 6,
+        max_lookback_days: int = 10,
     ):
         if not api_key:
             raise RuntimeError("UNIVERSE_SOURCE=polygon requires POLYGON_API_KEY")
@@ -162,22 +178,18 @@ class PolygonGroupedSource:
         )
 
     def _latest_session_with_data(self) -> tuple[str, list[dict[str, Any]]]:
-        day = datetime.now(_ET).date()
-        for _ in range(self._max_lookback):
-            iso = day.isoformat()
-            rows = self._fetch_grouped(iso)
+        for day in _weekdays_back(datetime.now(_ET).date(), self._max_lookback):
+            rows = self._fetch_grouped(day.isoformat())
             if rows:
-                return iso, rows
-            day -= timedelta(days=1)
+                return day.isoformat(), rows
         return "", []
 
     def _session_before(self, date_iso: str) -> list[dict[str, Any]]:
-        day = datetime.fromisoformat(date_iso).date() - timedelta(days=1)
-        for _ in range(self._max_lookback):
+        start = datetime.fromisoformat(date_iso).date() - timedelta(days=1)
+        for day in _weekdays_back(start, self._max_lookback):
             rows = self._fetch_grouped(day.isoformat())
             if rows:
                 return rows
-            day -= timedelta(days=1)
         return []
 
     def _fetch_grouped(self, date_iso: str) -> list[dict[str, Any]]:

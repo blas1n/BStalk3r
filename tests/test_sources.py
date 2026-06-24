@@ -6,17 +6,39 @@ and `PolygonGainersSource._fetch_raw` is monkeypatched with a captured payload.
 
 from __future__ import annotations
 
+from datetime import date
+
 from src.models import MarketSnapshot
 from src.sources import (
     PolygonGainersSource,
     PolygonGroupedSource,
     ScreenBounds,
     WatchlistSource,
+    _weekdays_back,
     polygon_gainers_to_snapshots,
     polygon_grouped_to_snapshots,
 )
 
 BOUNDS = ScreenBounds(min_price=1.0, max_price=50.0, min_change_pct=5.0)
+
+
+def test_weekdays_back_skips_weekends():
+    # 2026-06-24 is a Wednesday; going back should skip Sat 06-20 / Sun 06-21
+    out = list(_weekdays_back(date(2026, 6, 24), 5))
+    assert out == [
+        date(2026, 6, 24),  # Wed
+        date(2026, 6, 23),  # Tue
+        date(2026, 6, 22),  # Mon
+        date(2026, 6, 19),  # Fri (skipped Sun 21, Sat 20)
+        date(2026, 6, 18),  # Thu
+    ]
+
+
+def test_weekdays_back_starting_on_weekend():
+    # start Sat 2026-06-20 -> first yielded is Fri 06-19
+    out = list(_weekdays_back(date(2026, 6, 20), 2))
+    assert out == [date(2026, 6, 19), date(2026, 6, 18)]
+
 
 # Trimmed real-shape Polygon /v2/snapshot/.../gainers payload.
 SAMPLE = {

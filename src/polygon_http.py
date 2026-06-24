@@ -1,10 +1,13 @@
 """Shared Polygon HTTP fetch with 429-aware retry.
 
-Polygon's free tier is 5 req/min; bursts (the grouped scan + the per-runner
-outcome tracker) periodically hit `429 Too Many Requests`. Left unhandled it
-crashes the daily job. This wrapper backs off (honoring `Retry-After`) and
-retries on 429; every other HTTPError is re-raised so callers keep their own
-403/404 ("no data") handling.
+Polygon's free tier is 5 req/min; bursts (the grouped scan stepping back day by
+day + the per-runner outcome tracker) periodically hit `429 Too Many Requests`.
+This wrapper backs off (honoring `Retry-After`) and retries on 429; every other
+HTTPError is re-raised so callers keep their own 403/404 ("no data") handling.
+
+The default backoff (5 tries × 30s) is sized to clear the free tier's ~60s rate
+window even when no `Retry-After` header is sent — a shorter budget let the
+sequential scan burst crash the daily job.
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ from typing import Any
 
 
 def get_json(
-    url: str, timeout: int = 20, retries: int = 4, base_sleep: float = 15.0
+    url: str, timeout: int = 20, retries: int = 5, base_sleep: float = 30.0
 ) -> dict[str, Any]:
     for attempt in range(retries):
         try:
