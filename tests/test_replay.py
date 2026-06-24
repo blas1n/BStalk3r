@@ -7,7 +7,7 @@ forward outcome for one horizon).
 
 from __future__ import annotations
 
-from src.replay import ReplayResult, simulate
+from src.replay import ReplayResult, round_trip_cost, simulate
 from src.scanner import ScanFilters
 
 # Replay filters: gate on the fields EOD data actually has (price/change/rvol),
@@ -81,6 +81,34 @@ def test_unscored_entries_counted_but_excluded_from_metrics():
     assert r.n_entered == 4  # PENDING passes the filter
     assert r.n_scored == 3  # but has no outcome yet -> not in metrics
     assert abs(r.avg_return - (10.0 + 6.0 - 4.0) / 3) < 1e-9
+
+
+def test_round_trip_cost_adds_cheap_surcharge():
+    # base only for a normal-priced name
+    assert round_trip_cost(10.0, base_pct=2.0, cheap_price=2.0, cheap_extra_pct=3.0) == 2.0
+    # cheap (< threshold) pays base + surcharge
+    assert round_trip_cost(1.5, base_pct=2.0, cheap_price=2.0, cheap_extra_pct=3.0) == 5.0
+
+
+def test_cost_reduces_net_return_and_winrate():
+    gross = simulate("gross", ROWS, BASE)
+    # flat 5% round-trip on every trade
+    net = simulate("net", ROWS, BASE, cost_fn=lambda r: 5.0)
+    assert abs(net.avg_return - (gross.avg_return - 5.0)) < 1e-9
+    # WIN1 +10 -> +5 (still win), WIN2 +6 -> +1 (win), LOSS -4 -> -9 (loss)
+    assert abs(net.win_rate - (2 / 3)) < 1e-9
+    # a stiff cost flips marginal winners to losers
+    stiff = simulate("stiff", ROWS, BASE, cost_fn=lambda r: 8.0)
+    assert abs(stiff.win_rate - (1 / 3)) < 1e-9  # only WIN1 (+10-8=+2) survives
+
+
+def test_cost_fn_can_be_price_aware():
+    # cheaper names cost more; WIN2 is $4 (cheap), WIN1 $8, LOSS $6
+    net = simulate("net", ROWS, BASE, cost_fn=lambda r: 5.0 if r["last_price"] < 5 else 1.0)
+    by = dict(zip([s for s in net.symbols], [None] * len(net.symbols), strict=False))
+    assert "WIN2" in by  # still entered (filter unaffected by cost)
+    # WIN1 10-1=9, WIN2 6-5=1, LOSS -4-1=-5 -> avg (9+1-5)/3
+    assert abs(net.avg_return - (9 + 1 - 5) / 3) < 1e-9
 
 
 def test_empty_entry_set_yields_none_metrics():

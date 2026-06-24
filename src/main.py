@@ -10,6 +10,7 @@ import argparse
 import sys
 import time
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import structlog
@@ -22,7 +23,7 @@ from src.forward_bars import ForwardBarsProvider, PolygonDailyBars
 from src.market_data import AlpacaMarketData, MarketDataProvider
 from src.models import PositionState
 from src.outcomes import compute_outcomes
-from src.replay import simulate
+from src.replay import round_trip_cost, simulate
 from src.risk import RiskParams, RiskState, check_entry_allowed, position_size
 from src.scanner import ScanFilters, scan_candidates
 from src.sources import (
@@ -262,15 +263,35 @@ def cmd_replay(
     source: str | None = None,
     sweep_rvol: list[float] | None = None,
     sweep_change: list[float] | None = None,
+    cost_pct: float | None = None,
+    gross: bool = False,
 ) -> int:
     """Re-simulate alternate parameter sets over stored screened+outcome data."""
     rows = db.get_screened_with_outcomes(horizon, start, end, source)
+    base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
+
+    def cost_fn(row: dict[str, Any]) -> float:
+        return round_trip_cost(
+            row["last_price"],
+            base_pct=base_cost,
+            cheap_price=settings.replay_cheap_price,
+            cheap_extra_pct=settings.replay_cheap_extra_pct,
+        )
+
     results = [
-        simulate(name, rows, f) for name, f in _build_variants(settings, sweep_rvol, sweep_change)
+        simulate(name, rows, f, cost_fn=cost_fn)
+        for name, f in _build_variants(settings, sweep_rvol, sweep_change)
     ]
 
     span = f" [{start or '…'}..{end or '…'}]" if (start or end) else ""
-    print(f"Replay over {len(rows)} screened runner(s) @ horizon {horizon}{span}")
+    if gross or base_cost == 0:
+        cost_note = "GROSS (no costs)"
+    else:
+        cost_note = (
+            f"net of {base_cost:g}% round-trip "
+            f"(+{settings.replay_cheap_extra_pct:g}% under ${settings.replay_cheap_price:g})"
+        )
+    print(f"Replay over {len(rows)} screened runner(s) @ horizon {horizon}{span} — {cost_note}")
     cols = ("variant", "enter", "score", "avg%", "med%", "win%", "maxgn%", "mdd%")
     print("  " + " ".join(f"{c:>8s}" if c != "variant" else f"{c:14s}" for c in cols))
     for r in results:
@@ -517,6 +538,10 @@ def main(argv: list[str] | None = None) -> int:
     p_replay.add_argument("--source", help="filter by screen source (polygon|watchlist)")
     p_replay.add_argument("--sweep-min-rvol", help="comma-separated rvol thresholds, e.g. 4,8,12")
     p_replay.add_argument("--sweep-min-day-change", help="comma-separated day-change %% thresholds")
+    p_replay.add_argument(
+        "--cost-pct", type=float, help="round-trip cost %% override (default from .env)"
+    )
+    p_replay.add_argument("--gross", action="store_true", help="ignore costs (gross returns)")
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -551,6 +576,8 @@ def main(argv: list[str] | None = None) -> int:
             source=args.source,
             sweep_rvol=_parse_floats(args.sweep_min_rvol),
             sweep_change=_parse_floats(args.sweep_min_day_change),
+            cost_pct=args.cost_pct,
+            gross=args.gross,
         )
 
     market = AlpacaMarketData(
