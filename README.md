@@ -88,6 +88,9 @@ uv run bstalk3r track --before 2026-06-01 --limit 50
 # 8. replay alternate parameters over the accumulated data (retrospection)
 uv run bstalk3r replay --horizon 3d
 uv run bstalk3r replay --horizon 3d --sweep-min-rvol 4,8,12,16
+
+# 9. intraday hit-and-run backtest over minute bars (the real strategy shape)
+uv run bstalk3r intraday --limit 40 --sweep-max-hold 15,30,60
 ```
 
 ### Getting Alpaca paper keys
@@ -272,6 +275,36 @@ names — low-float runners have brutal spreads). This is a research assumption,
 not a measured spread (grouped EOD has no quote). Use `--cost-pct X` to override
 or `--gross` to ignore costs. Costs matter: a thin gross edge on these illiquid
 names usually goes net-negative — the cost model keeps the retrospection honest.
+
+**Intraday hit-and-run** (`bstalk3r intraday`). The EOD replay above measures a
+*different* strategy (buy-at-close, hold N days); the real strategy is intraday
+"hit and run". This backtests it on **free historical minute bars**: for each
+screened runner it reconstructs the entry (first minute the day-change crosses
+the trigger, prior close backed out of `day_change_pct`) and walks the minute
+bars applying the **live** `strategy.evaluate_exit` (stop / take-profit /
+trailing / max-hold / force-close-at-bell), swept across max-hold windows, net of
+costs:
+
+```
+$ bstalk3r intraday --limit 40 --sweep-max-hold 15,30,60
+Intraday hit-and-run over 40/40 runner(s) with minute data (entry +5%, net of 2%+cheap round-trip):
+  max_hold   trades     avg%     med%     win%  avgHold   exits
+        15       40     -0.9     -1.1     47.5     12.1   max_hold:23, stop_loss:11, take_profit_scale:3, ...
+        30       40     -0.1     -0.0     47.5     19.4   max_hold:20, stop_loss:12, take_profit_scale:4, ...
+        60       40      0.8      0.2     52.5     33.8   max_hold:17, stop_loss:13, take_profit_scale:5, ...
+```
+
+That first real sample is telling: buy-and-hold-N-days was deeply net-negative
+(−2 to −5%), but **intraday hit-and-run is ~breakeven net** and *improves* with a
+longer cap (60-min +0.8% / 52.5% win) — the strategy *shape* looks right, while
+exiting too fast (15-min) hurts. Promising, not proven: n=40, one ~2-week regime,
+survivorship-optimistic.
+
+Caveats: survivorship-optimistic (only stocks already known to have run that day);
+fills modeled at the triggering bar's close; take-profit is a full exit (no
+partial scale-out) in v1. It answers *execution-given-detection* — if hit-and-run
+doesn't profit even with hindsight entry timing, paying for live intraday
+detection isn't worth it. Design: `~/Docs/BStalk3r/Retrospection_Data_Model_2026-06-10.md`.
 
 Inspect with any SQLite client:
 

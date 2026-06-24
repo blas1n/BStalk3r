@@ -20,7 +20,9 @@ from src.config import Settings, load_settings
 from src.database import Database
 from src.execution import ExecutionEngine
 from src.forward_bars import ForwardBarsProvider, PolygonDailyBars
+from src.intraday import simulate_trade
 from src.market_data import AlpacaMarketData, MarketDataProvider
+from src.minute_bars import MinuteBarsProvider, PolygonMinuteBars
 from src.models import PositionState
 from src.outcomes import compute_outcomes
 from src.replay import round_trip_cost, simulate
@@ -308,6 +310,94 @@ def _fmt(x: float | None, width: int = 8) -> str:
     return f"{x:>{width}.1f}" if x is not None else f"{'—':>{width}}"
 
 
+def cmd_intraday(
+    settings: Settings,
+    db: Database,
+    bars: MinuteBarsProvider,
+    limit: int = 40,
+    max_holds: list[float] | None = None,
+    entry_min_change: float | None = None,
+    cost_pct: float | None = None,
+    gross: bool = False,
+    throttle_sec: int | None = None,
+    source: str | None = None,
+) -> int:
+    """Intraday hit-and-run backtest: enter at the runner trigger, exit on the
+    live rules, swept across max-hold windows. Net of costs by default.
+    """
+    settings.validate_paper_safety()
+    holds = max_holds or [15.0, 30.0, 60.0]
+    trigger = settings.min_day_change_pct if entry_min_change is None else entry_min_change
+    base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+
+    def cost_fn(price: float) -> float:
+        return round_trip_cost(
+            price, base_cost, settings.replay_cheap_price, settings.replay_cheap_extra_pct
+        )
+
+    runners = db.get_screened_band(
+        settings.min_price, settings.max_price, limit=limit, source=source
+    )
+    trades: dict[float, list] = {mh: [] for mh in holds}
+    fetched = 0
+    for i, row in enumerate(runners):
+        prev_close = row["last_price"] / (1 + row["day_change_pct"] / 100)
+        session_bars = bars.fetch(row["symbol"], row["session_date"])
+        if not session_bars:
+            continue
+        fetched += 1
+        for mh in holds:
+            ep = ExitParams(
+                stop_loss_pct=settings.stop_loss_pct,
+                take_profit_pct=settings.take_profit_pct,
+                scale_out_fraction=settings.scale_out_fraction,
+                trailing_stop_pct=settings.trailing_stop_pct,
+                max_hold_minutes=mh,
+                exit_spread_pct=settings.exit_spread_pct,
+            )
+            t = simulate_trade(
+                session_bars,
+                prev_close,
+                trigger,
+                settings.min_price,
+                settings.max_price,
+                ep,
+                cost_fn=cost_fn,
+            )
+            if t.entered:
+                trades[mh].append(t)
+        if throttle and i < len(runners) - 1:
+            time.sleep(throttle)
+
+    cost_note = "GROSS" if base_cost == 0 else f"net of {base_cost:g}%+cheap round-trip"
+    print(
+        f"Intraday hit-and-run over {fetched}/{len(runners)} runner(s) with minute data "
+        f"(entry +{trigger:g}%, {cost_note}):"
+    )
+    cols = ("max_hold", "trades", "avg%", "med%", "win%", "avgHold", "exits")
+    print("  " + " ".join(f"{c:>8s}" if c != "exits" else f"  {c}" for c in cols))
+    for mh in holds:
+        ts = trades[mh]
+        nets = [t.net_return_pct for t in ts]
+        if not nets:
+            print(f"  {mh:>8.0f} {0:>8d}")
+            continue
+        avg = sum(nets) / len(nets)
+        med = sorted(nets)[len(nets) // 2]
+        win = sum(1 for x in nets if x > 0) / len(nets) * 100
+        avg_hold = sum(t.held_min for t in ts) / len(ts)
+        reasons: dict[str, int] = {}
+        for t in ts:
+            reasons[t.exit_reason or "?"] = reasons.get(t.exit_reason or "?", 0) + 1
+        top = ", ".join(f"{k}:{v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1]))
+        print(
+            f"  {mh:>8.0f} {len(ts):>8d} {avg:>8.1f} {med:>8.1f} {win:>8.1f} "
+            f"{avg_hold:>8.1f}   {top}"
+        )
+    return 0
+
+
 def cmd_run(
     settings: Settings,
     source: SnapshotSource,
@@ -542,6 +632,17 @@ def main(argv: list[str] | None = None) -> int:
         "--cost-pct", type=float, help="round-trip cost %% override (default from .env)"
     )
     p_replay.add_argument("--gross", action="store_true", help="ignore costs (gross returns)")
+    p_intra = sub.add_parser("intraday", help="intraday hit-and-run backtest over minute bars")
+    p_intra.add_argument("--limit", type=int, default=40, help="runners to sample (Polygon calls)")
+    p_intra.add_argument(
+        "--sweep-max-hold", help="comma-separated max-hold minutes (default 15,30,60)"
+    )
+    p_intra.add_argument(
+        "--entry-min-change", type=float, help="entry trigger %% (default MIN_DAY_CHANGE_PCT)"
+    )
+    p_intra.add_argument("--source", help="filter screened source (polygon|watchlist)")
+    p_intra.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
+    p_intra.add_argument("--gross", action="store_true", help="ignore costs")
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -565,6 +666,24 @@ def main(argv: list[str] | None = None) -> int:
             print(f"❌ {exc}", file=sys.stderr)
             return 2
         return cmd_track(settings, db, bars, before_date=args.before, limit=args.limit)
+
+    if args.command == "intraday":
+        try:
+            minute_bars = PolygonMinuteBars(settings.polygon_api_key)
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_intraday(
+            settings,
+            db,
+            minute_bars,
+            limit=args.limit,
+            max_holds=_parse_floats(args.sweep_max_hold),
+            entry_min_change=args.entry_min_change,
+            cost_pct=args.cost_pct,
+            gross=args.gross,
+            source=args.source,
+        )
 
     if args.command == "replay":
         return cmd_replay(

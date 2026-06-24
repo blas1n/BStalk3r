@@ -450,6 +450,29 @@ class Database:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_screened_band(
+        self,
+        min_price: float,
+        max_price: float,
+        limit: int | None = None,
+        source: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Screened runners inside the tradeable price band, newest first.
+
+        The intraday backtest re-derives prior close from `day_change_pct`, so
+        rows with a non-positive change (can't back out prev close) are excluded.
+        """
+        sql = "SELECT * FROM screened WHERE last_price BETWEEN ? AND ? AND day_change_pct > -100"
+        params: list[Any] = [min_price, max_price]
+        if source:
+            sql += " AND source = ?"
+            params.append(source)
+        sql += " ORDER BY session_date DESC, day_change_pct DESC"
+        if limit:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
     def get_screened_with_outcomes(
         self,
         horizon: str,
