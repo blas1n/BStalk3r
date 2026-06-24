@@ -89,8 +89,9 @@ uv run bstalk3r track --before 2026-06-01 --limit 50
 uv run bstalk3r replay --horizon 3d
 uv run bstalk3r replay --horizon 3d --sweep-min-rvol 4,8,12,16
 
-# 9. intraday hit-and-run backtest over minute bars (the real strategy shape)
+# 9. intraday hit-and-run backtest — grid-sweep entry / take-profit / max-hold
 uv run bstalk3r intraday --limit 40 --sweep-max-hold 15,30,60
+uv run bstalk3r intraday --limit 40 --sweep-entry 3,5,8 --sweep-take-profit 8,12 --sweep-max-hold 30,60
 ```
 
 ### Getting Alpaca paper keys
@@ -282,16 +283,19 @@ names usually goes net-negative — the cost model keeps the retrospection hones
 screened runner it reconstructs the entry (first minute the day-change crosses
 the trigger, prior close backed out of `day_change_pct`) and walks the minute
 bars applying the **live** `strategy.evaluate_exit` (stop / take-profit /
-trailing / max-hold / force-close-at-bell), swept across max-hold windows, net of
-costs:
+trailing / max-hold / force-close-at-bell). **Grid-sweep** entry-trigger /
+take-profit / max-hold (`--sweep-entry`, `--sweep-take-profit`,
+`--sweep-max-hold`) — bars are fetched once per runner, so every grid cell is
+just extra pure simulation (the rate-limited Polygon cost is independent of grid
+size). Net of costs:
 
 ```
 $ bstalk3r intraday --limit 40 --sweep-max-hold 15,30,60
-Intraday hit-and-run over 40/40 runner(s) with minute data (entry +5%, net of 2%+cheap round-trip):
-  max_hold   trades     avg%     med%     win%  avgHold   exits
-        15       40     -0.9     -1.1     47.5     12.1   max_hold:23, stop_loss:11, take_profit_scale:3, ...
-        30       40     -0.1     -0.0     47.5     19.4   max_hold:20, stop_loss:12, take_profit_scale:4, ...
-        60       40      0.8      0.2     52.5     33.8   max_hold:17, stop_loss:13, take_profit_scale:5, ...
+Intraday hit-and-run over 40/40 runner(s) with minute data (net of 2%+cheap round-trip):
+  variant        trades    avg%    med%   win%  avgHold   exits
+  h15                40    -0.9    -1.1   47.5     12.1   max_hold:23, stop_loss:11, take_profit_scale:3
+  h30                40    -0.1    -0.0   47.5     19.4   max_hold:20, stop_loss:12, take_profit_scale:4
+  h60                40     0.8     0.2   52.5     33.8   max_hold:17, stop_loss:13, take_profit_scale:5
 ```
 
 That first real sample is telling: buy-and-hold-N-days was deeply net-negative
