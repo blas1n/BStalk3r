@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -310,26 +311,63 @@ def _fmt(x: float | None, width: int = 8) -> str:
     return f"{x:>{width}.1f}" if x is not None else f"{'—':>{width}}"
 
 
+@dataclass(frozen=True)
+class _IntradayVariant:
+    label: str
+    entry: float  # entry trigger %
+    take_profit_pct: float  # fraction (0.15)
+    max_hold: float  # minutes
+
+
+def _intraday_variants(
+    settings: Settings,
+    sweep_entry: list[float] | None,
+    sweep_tp: list[float] | None,
+    sweep_hold: list[float] | None,
+) -> list[_IntradayVariant]:
+    """Cartesian grid over whatever dims are swept; unswept dims use .env.
+
+    Bars are fetched once per runner, so every grid cell is just extra pure
+    simulation — the rate-limited Polygon cost is independent of grid size.
+    """
+    entries = sweep_entry or [settings.min_day_change_pct]
+    tps = sweep_tp or [settings.take_profit_pct * 100]  # CLI sweeps in %, store fraction
+    holds = sweep_hold or [settings.max_hold_minutes]
+    out: list[_IntradayVariant] = []
+    for e in entries:
+        for tp in tps:
+            for h in holds:
+                parts = []
+                if sweep_entry:
+                    parts.append(f"e{e:g}")
+                if sweep_tp:
+                    parts.append(f"tp{tp:g}")
+                if sweep_hold:
+                    parts.append(f"h{h:g}")
+                out.append(_IntradayVariant(" ".join(parts) or "baseline", e, tp / 100, h))
+    return out
+
+
 def cmd_intraday(
     settings: Settings,
     db: Database,
     bars: MinuteBarsProvider,
     limit: int = 40,
-    max_holds: list[float] | None = None,
-    entry_min_change: float | None = None,
+    sweep_entry: list[float] | None = None,
+    sweep_tp: list[float] | None = None,
+    sweep_hold: list[float] | None = None,
     cost_pct: float | None = None,
     gross: bool = False,
     throttle_sec: int | None = None,
     source: str | None = None,
 ) -> int:
     """Intraday hit-and-run backtest: enter at the runner trigger, exit on the
-    live rules, swept across max-hold windows. Net of costs by default.
+    live rules. Sweep entry-trigger / take-profit / max-hold; net of costs.
     """
     settings.validate_paper_safety()
-    holds = max_holds or [15.0, 30.0, 60.0]
-    trigger = settings.min_day_change_pct if entry_min_change is None else entry_min_change
     base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
     throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+    variants = _intraday_variants(settings, sweep_entry, sweep_tp, sweep_hold)
 
     def cost_fn(price: float) -> float:
         return round_trip_cost(
@@ -339,7 +377,7 @@ def cmd_intraday(
     runners = db.get_screened_band(
         settings.min_price, settings.max_price, limit=limit, source=source
     )
-    trades: dict[float, list] = {mh: [] for mh in holds}
+    trades: dict[str, list] = {v.label: [] for v in variants}
     fetched = 0
     for i, row in enumerate(runners):
         prev_close = row["last_price"] / (1 + row["day_change_pct"] / 100)
@@ -347,41 +385,41 @@ def cmd_intraday(
         if not session_bars:
             continue
         fetched += 1
-        for mh in holds:
+        for v in variants:
             ep = ExitParams(
                 stop_loss_pct=settings.stop_loss_pct,
-                take_profit_pct=settings.take_profit_pct,
+                take_profit_pct=v.take_profit_pct,
                 scale_out_fraction=settings.scale_out_fraction,
                 trailing_stop_pct=settings.trailing_stop_pct,
-                max_hold_minutes=mh,
+                max_hold_minutes=v.max_hold,
                 exit_spread_pct=settings.exit_spread_pct,
             )
             t = simulate_trade(
                 session_bars,
                 prev_close,
-                trigger,
+                v.entry,
                 settings.min_price,
                 settings.max_price,
                 ep,
                 cost_fn=cost_fn,
             )
             if t.entered:
-                trades[mh].append(t)
+                trades[v.label].append(t)
         if throttle and i < len(runners) - 1:
             time.sleep(throttle)
 
     cost_note = "GROSS" if base_cost == 0 else f"net of {base_cost:g}%+cheap round-trip"
     print(
         f"Intraday hit-and-run over {fetched}/{len(runners)} runner(s) with minute data "
-        f"(entry +{trigger:g}%, {cost_note}):"
+        f"({cost_note}):"
     )
-    cols = ("max_hold", "trades", "avg%", "med%", "win%", "avgHold", "exits")
-    print("  " + " ".join(f"{c:>8s}" if c != "exits" else f"  {c}" for c in cols))
-    for mh in holds:
-        ts = trades[mh]
+    hdr = f"  {'variant':14s} {'trades':>6s} {'avg%':>7s} {'med%':>7s} {'win%':>6s} {'avgHold':>7s}"
+    print(hdr + "   exits")
+    for v in variants:
+        ts = trades[v.label]
         nets = [t.net_return_pct for t in ts]
         if not nets:
-            print(f"  {mh:>8.0f} {0:>8d}")
+            print(f"  {v.label:14s} {0:>6d}")
             continue
         avg = sum(nets) / len(nets)
         med = sorted(nets)[len(nets) // 2]
@@ -390,11 +428,9 @@ def cmd_intraday(
         reasons: dict[str, int] = {}
         for t in ts:
             reasons[t.exit_reason or "?"] = reasons.get(t.exit_reason or "?", 0) + 1
-        top = ", ".join(f"{k}:{v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1]))
-        print(
-            f"  {mh:>8.0f} {len(ts):>8d} {avg:>8.1f} {med:>8.1f} {win:>8.1f} "
-            f"{avg_hold:>8.1f}   {top}"
-        )
+        top = ", ".join(f"{k}:{n}" for k, n in sorted(reasons.items(), key=lambda x: -x[1])[:3])
+        body = f"  {v.label:14s} {len(ts):>6d} {avg:>7.1f} {med:>7.1f} {win:>6.1f} {avg_hold:>7.1f}"
+        print(f"{body}   {top}")
     return 0
 
 
@@ -634,11 +670,12 @@ def main(argv: list[str] | None = None) -> int:
     p_replay.add_argument("--gross", action="store_true", help="ignore costs (gross returns)")
     p_intra = sub.add_parser("intraday", help="intraday hit-and-run backtest over minute bars")
     p_intra.add_argument("--limit", type=int, default=40, help="runners to sample (Polygon calls)")
+    p_intra.add_argument("--sweep-entry", help="comma-separated entry-trigger %% (e.g. 3,5,8,12)")
     p_intra.add_argument(
-        "--sweep-max-hold", help="comma-separated max-hold minutes (default 15,30,60)"
+        "--sweep-take-profit", help="comma-separated take-profit %% (e.g. 6,8,10,15)"
     )
     p_intra.add_argument(
-        "--entry-min-change", type=float, help="entry trigger %% (default MIN_DAY_CHANGE_PCT)"
+        "--sweep-max-hold", help="comma-separated max-hold minutes (e.g. 15,30,60)"
     )
     p_intra.add_argument("--source", help="filter screened source (polygon|watchlist)")
     p_intra.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
@@ -678,8 +715,9 @@ def main(argv: list[str] | None = None) -> int:
             db,
             minute_bars,
             limit=args.limit,
-            max_holds=_parse_floats(args.sweep_max_hold),
-            entry_min_change=args.entry_min_change,
+            sweep_entry=_parse_floats(args.sweep_entry),
+            sweep_tp=_parse_floats(args.sweep_take_profit),
+            sweep_hold=_parse_floats(args.sweep_max_hold),
             cost_pct=args.cost_pct,
             gross=args.gross,
             source=args.source,

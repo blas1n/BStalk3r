@@ -55,12 +55,36 @@ def test_intraday_runs_and_reports(tmp_path, capsys):
     # bars: enter at 10.6, run to +16% (take-profit), pad a trailing bar
     provider = _FakeMinutes({"WIN": _bars([10.6, 11.0, 12.3, 12.3])})
 
-    rc = main_mod.cmd_intraday(settings, db, provider, limit=10, max_holds=[30.0], throttle_sec=0)
+    rc = main_mod.cmd_intraday(settings, db, provider, limit=10, sweep_hold=[30.0], throttle_sec=0)
     assert rc == 0
     out = capsys.readouterr().out
     assert "Intraday hit-and-run over 1/1 runner(s)" in out
     assert "take_profit_scale" in out  # exit reason surfaced
     assert provider.calls == [("WIN", "2026-06-09")]
+
+
+def test_intraday_grid_fetches_bars_once_per_runner(tmp_path, capsys):
+    settings = _settings(tmp_path)
+    db = Database(settings.db_path)
+    db.init_schema()
+    _seed(db, "WIN", "2026-06-09", 12.0, 20.0)
+    provider = _FakeMinutes({"WIN": _bars([10.6, 11.0, 12.3, 12.3])})
+
+    # 2 entry x 2 take-profit x 2 hold = 8 grid cells, but ONE fetch
+    rc = main_mod.cmd_intraday(
+        settings,
+        db,
+        provider,
+        limit=10,
+        sweep_entry=[3.0, 5.0],
+        sweep_tp=[8.0, 15.0],
+        sweep_hold=[15.0, 30.0],
+        throttle_sec=0,
+    )
+    assert rc == 0
+    assert provider.calls == [("WIN", "2026-06-09")]  # fetched once despite 8 variants
+    out = capsys.readouterr().out
+    assert "e3 tp8 h15" in out and "e5 tp15 h30" in out  # labeled grid rows
 
 
 def test_intraday_skips_runner_without_minute_data(tmp_path, capsys):
@@ -70,7 +94,7 @@ def test_intraday_skips_runner_without_minute_data(tmp_path, capsys):
     _seed(db, "NODATA", "2026-06-09", 12.0, 20.0)
     provider = _FakeMinutes({})  # no bars -> 403/empty
 
-    rc = main_mod.cmd_intraday(settings, db, provider, limit=10, max_holds=[30.0], throttle_sec=0)
+    rc = main_mod.cmd_intraday(settings, db, provider, limit=10, sweep_hold=[30.0], throttle_sec=0)
     assert rc == 0
     assert "over 0/1 runner(s)" in capsys.readouterr().out
 
