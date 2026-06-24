@@ -8,12 +8,25 @@ real entry logic — the whole reason scanner/strategy/risk were kept pure.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from statistics import mean, median
 from typing import Any
 
 from src.models import MarketSnapshot
 from src.scanner import ScanFilters, passes_filters
+
+
+def round_trip_cost(
+    price: float, base_pct: float, cheap_price: float, cheap_extra_pct: float
+) -> float:
+    """Estimated round-trip transaction cost (%) for one trade.
+
+    Low-priced names trade with much wider relative spreads/slippage, so add a
+    surcharge below `cheap_price`. This is a research assumption (grouped EOD
+    data has no real quote), not a measured spread — tune to taste.
+    """
+    return base_pct + (cheap_extra_pct if price < cheap_price else 0.0)
 
 
 @dataclass(frozen=True)
@@ -40,16 +53,26 @@ def _snapshot(row: dict[str, Any]) -> MarketSnapshot:
     )
 
 
-def simulate(name: str, rows: list[dict[str, Any]], filters: ScanFilters) -> ReplayResult:
+def simulate(
+    name: str,
+    rows: list[dict[str, Any]],
+    filters: ScanFilters,
+    cost_fn: Callable[[dict[str, Any]], float] | None = None,
+) -> ReplayResult:
     """Entry set under `filters`, scored by the rows' forward outcomes.
 
     Each row carries screened fields plus `ret` / `max_gain` / `max_drawdown`
     for one horizon (None when the outcome isn't computed yet). Unscored entries
     count toward `n_entered` but are excluded from the metrics.
+
+    `cost_fn(row) -> pct` is the round-trip transaction cost subtracted from each
+    trade's return / max-gain / max-drawdown — so metrics are net of costs. With
+    no cost_fn the result is gross (back-compatible).
     """
+    cost = cost_fn or (lambda r: 0.0)
     entered = [r for r in rows if passes_filters(_snapshot(r), filters)]
     scored = [r for r in entered if r.get("ret") is not None]
-    rets = [r["ret"] for r in scored]
+    rets = [r["ret"] - cost(r) for r in scored]
 
     return ReplayResult(
         name=name,
@@ -58,7 +81,7 @@ def simulate(name: str, rows: list[dict[str, Any]], filters: ScanFilters) -> Rep
         avg_return=mean(rets) if rets else None,
         median_return=median(rets) if rets else None,
         win_rate=(sum(1 for x in rets if x > 0) / len(rets)) if rets else None,
-        avg_max_gain=(mean([r["max_gain"] for r in scored]) if scored else None),
-        avg_max_drawdown=(mean([r["max_drawdown"] for r in scored]) if scored else None),
+        avg_max_gain=(mean([r["max_gain"] - cost(r) for r in scored]) if scored else None),
+        avg_max_drawdown=(mean([r["max_drawdown"] - cost(r) for r in scored]) if scored else None),
         symbols=[r["symbol"] for r in entered],
     )

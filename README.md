@@ -266,6 +266,13 @@ the intraday-only gates (vol-accel / spread) permissive; once intraday data is
 accumulated (paid Polygon), those become sweepable too. Design notes:
 `~/Docs/BStalk3r/Retrospection_Data_Model_2026-06-10.md`.
 
+**Costs are on by default.** Metrics are *net* of a round-trip transaction-cost
+assumption (`REPLAY_COST_PCT`, default 2%, plus a surcharge for sub-`$REPLAY_CHEAP_PRICE`
+names — low-float runners have brutal spreads). This is a research assumption,
+not a measured spread (grouped EOD has no quote). Use `--cost-pct X` to override
+or `--gross` to ignore costs. Costs matter: a thin gross edge on these illiquid
+names usually goes net-negative — the cost model keeps the retrospection honest.
+
 Inspect with any SQLite client:
 
 ```bash

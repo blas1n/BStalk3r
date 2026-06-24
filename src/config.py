@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     outcome_throttle_sec: int = 13
     outcome_track_limit: int = 40
 
+    # Replay transaction-cost assumption (round-trip %). Low-priced names get a
+    # surcharge (wider spreads). Research assumption — EOD data has no real quote.
+    replay_cost_pct: float = 2.0
+    replay_cheap_price: float = 2.0
+    replay_cheap_extra_pct: float = 2.0
+
     # ---- scanner ----
     min_price: float = 1.0
     max_price: float = 50.0
