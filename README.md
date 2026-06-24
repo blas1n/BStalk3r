@@ -92,6 +92,8 @@ uv run bstalk3r replay --horizon 3d --sweep-min-rvol 4,8,12,16
 # 9. intraday hit-and-run backtest — grid-sweep entry / take-profit / max-hold
 uv run bstalk3r intraday --limit 40 --sweep-max-hold 15,30,60
 uv run bstalk3r intraday --limit 40 --sweep-entry 3,5,8 --sweep-take-profit 8,12 --sweep-max-hold 30,60
+# out-of-sample: tune on sessions <= train-end, score on the later (unseen) ones
+uv run bstalk3r intraday --limit 1000 --sweep-entry 3,5,8 --train-end 2026-06-12
 ```
 
 ### Getting Alpaca paper keys
@@ -308,7 +310,14 @@ Caveats: survivorship-optimistic (only stocks already known to have run that day
 fills modeled at the triggering bar's close; take-profit is a full exit (no
 partial scale-out) in v1. It answers *execution-given-detection* — if hit-and-run
 doesn't profit even with hindsight entry timing, paying for live intraday
-detection isn't worth it. Design: `~/Docs/BStalk3r/Retrospection_Data_Model_2026-06-10.md`.
+detection isn't worth it.
+
+**Out-of-sample (`--train-end DATE`).** A grid that's only scored on the same data
+it was tuned on is overfit by construction. With `--train-end`, runners split
+into train (≤) / test (>) and every variant is scored on both; the tool flags
+the *train-best* variant and whether it **holds up or collapses** on the unseen
+test sessions — the real test of whether a parameter edge is genuine.
+Design: `~/Docs/BStalk3r/Retrospection_Data_Model_2026-06-10.md`.
 
 Inspect with any SQLite client:
 

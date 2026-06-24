@@ -46,6 +46,31 @@ def _seed(db, symbol, session, last_price, chg):
     )
 
 
+def test_intraday_oos_split_reports_train_and_test(tmp_path, capsys):
+    settings = _settings(tmp_path)
+    db = Database(settings.db_path)
+    db.init_schema()
+    _seed(db, "TRAIN", "2026-06-09", 12.0, 20.0)  # train side
+    _seed(db, "TEST", "2026-06-17", 12.0, 20.0)  # test side
+    bars = _bars([10.6, 11.0, 12.3, 12.3])
+    provider = _FakeMinutes({"TRAIN": bars, "TEST": bars})
+
+    rc = main_mod.cmd_intraday(
+        settings,
+        db,
+        provider,
+        limit=10,
+        sweep_hold=[30.0],
+        throttle_sec=0,
+        train_end="2026-06-12",
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Out-of-sample split at 2026-06-12" in out
+    assert "nTr" in out and "nTe" in out
+    assert "Train-best" in out  # verdict line present
+
+
 def test_intraday_runs_and_reports(tmp_path, capsys):
     settings = _settings(tmp_path)
     db = Database(settings.db_path)
