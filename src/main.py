@@ -317,6 +317,7 @@ class _IntradayVariant:
     entry: float  # entry trigger %
     take_profit_pct: float  # fraction (0.15)
     max_hold: float  # minutes
+    trailing_pct: float  # fraction (0.08)
 
 
 def _intraday_variants(
@@ -324,6 +325,7 @@ def _intraday_variants(
     sweep_entry: list[float] | None,
     sweep_tp: list[float] | None,
     sweep_hold: list[float] | None,
+    sweep_trail: list[float] | None = None,
 ) -> list[_IntradayVariant]:
     """Cartesian grid over whatever dims are swept; unswept dims use .env.
 
@@ -333,18 +335,24 @@ def _intraday_variants(
     entries = sweep_entry or [settings.min_day_change_pct]
     tps = sweep_tp or [settings.take_profit_pct * 100]  # CLI sweeps in %, store fraction
     holds = sweep_hold or [settings.max_hold_minutes]
+    trails = sweep_trail or [settings.trailing_stop_pct * 100]
     out: list[_IntradayVariant] = []
     for e in entries:
         for tp in tps:
             for h in holds:
-                parts = []
-                if sweep_entry:
-                    parts.append(f"e{e:g}")
-                if sweep_tp:
-                    parts.append(f"tp{tp:g}")
-                if sweep_hold:
-                    parts.append(f"h{h:g}")
-                out.append(_IntradayVariant(" ".join(parts) or "baseline", e, tp / 100, h))
+                for tr in trails:
+                    parts = []
+                    if sweep_entry:
+                        parts.append(f"e{e:g}")
+                    if sweep_tp:
+                        parts.append(f"tp{tp:g}")
+                    if sweep_hold:
+                        parts.append(f"h{h:g}")
+                    if sweep_trail:
+                        parts.append(f"tr{tr:g}")
+                    out.append(
+                        _IntradayVariant(" ".join(parts) or "baseline", e, tp / 100, h, tr / 100)
+                    )
     return out
 
 
@@ -356,6 +364,7 @@ def cmd_intraday(
     sweep_entry: list[float] | None = None,
     sweep_tp: list[float] | None = None,
     sweep_hold: list[float] | None = None,
+    sweep_trail: list[float] | None = None,
     cost_pct: float | None = None,
     gross: bool = False,
     throttle_sec: int | None = None,
@@ -372,7 +381,7 @@ def cmd_intraday(
     settings.validate_paper_safety()
     base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
     throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
-    variants = _intraday_variants(settings, sweep_entry, sweep_tp, sweep_hold)
+    variants = _intraday_variants(settings, sweep_entry, sweep_tp, sweep_hold, sweep_trail)
 
     def cost_fn(price: float) -> float:
         return round_trip_cost(
@@ -396,7 +405,7 @@ def cmd_intraday(
                 stop_loss_pct=settings.stop_loss_pct,
                 take_profit_pct=v.take_profit_pct,
                 scale_out_fraction=settings.scale_out_fraction,
-                trailing_stop_pct=settings.trailing_stop_pct,
+                trailing_stop_pct=v.trailing_pct,
                 max_hold_minutes=v.max_hold,
                 exit_spread_pct=settings.exit_spread_pct,
             )
@@ -724,6 +733,7 @@ def main(argv: list[str] | None = None) -> int:
     p_intra.add_argument(
         "--sweep-max-hold", help="comma-separated max-hold minutes (e.g. 15,30,60)"
     )
+    p_intra.add_argument("--sweep-trailing", help="comma-separated trailing-stop %% (e.g. 8,15,25)")
     p_intra.add_argument("--source", help="filter screened source (polygon|watchlist)")
     p_intra.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
     p_intra.add_argument("--gross", action="store_true", help="ignore costs")
@@ -768,6 +778,7 @@ def main(argv: list[str] | None = None) -> int:
             sweep_entry=_parse_floats(args.sweep_entry),
             sweep_tp=_parse_floats(args.sweep_take_profit),
             sweep_hold=_parse_floats(args.sweep_max_hold),
+            sweep_trail=_parse_floats(args.sweep_trailing),
             cost_pct=args.cost_pct,
             gross=args.gross,
             source=args.source,
