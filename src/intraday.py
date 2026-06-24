@@ -38,6 +38,24 @@ class IntradayTrade:
     net_return_pct: float = 0.0
 
 
+def aggregate(trades: list[IntradayTrade]) -> dict[str, Any] | None:
+    """Net-return stats over a set of trades (None if empty)."""
+    if not trades:
+        return None
+    nets = [t.net_return_pct for t in trades]
+    reasons: dict[str, int] = {}
+    for t in trades:
+        reasons[t.exit_reason or "?"] = reasons.get(t.exit_reason or "?", 0) + 1
+    return {
+        "n": len(trades),
+        "avg": sum(nets) / len(nets),
+        "median": sorted(nets)[len(nets) // 2],
+        "win_rate": sum(1 for x in nets if x > 0) / len(nets) * 100,
+        "avg_hold": sum(t.held_min for t in trades) / len(trades),
+        "reasons": reasons,
+    }
+
+
 def reconstruct_entry(
     bars: list[dict[str, Any]],
     prev_close: float,

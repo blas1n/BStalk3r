@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from src.intraday import reconstruct_entry, simulate_trade
+from src.intraday import IntradayTrade, aggregate, reconstruct_entry, simulate_trade
 from src.strategy import ExitParams
 
 T0 = datetime(2026, 6, 9, 13, 30, tzinfo=UTC)  # 09:30 ET
@@ -105,3 +105,28 @@ def test_net_return_applies_cost():
 def test_not_entered_trade_is_flagged():
     t = _trade([10.0, 10.1])  # never crosses entry
     assert t.entered is False
+
+
+# ---- aggregate ----
+
+
+def _tr(net, reason="x", held=10.0):
+    return IntradayTrade(entered=True, net_return_pct=net, exit_reason=reason, held_min=held)
+
+
+def test_aggregate_empty_is_none():
+    assert aggregate([]) is None
+
+
+def test_aggregate_metrics():
+    a = aggregate([_tr(10.0), _tr(6.0), _tr(-4.0)])
+    assert a["n"] == 3
+    assert abs(a["avg"] - 4.0) < 1e-9
+    assert a["median"] == 6.0
+    assert abs(a["win_rate"] - (2 / 3) * 100) < 1e-9
+
+
+def test_aggregate_counts_reasons():
+    a = aggregate([_tr(1, "stop_loss"), _tr(2, "stop_loss"), _tr(3, "max_hold")])
+    assert a["reasons"]["stop_loss"] == 2
+    assert a["reasons"]["max_hold"] == 1

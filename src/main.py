@@ -21,7 +21,7 @@ from src.config import Settings, load_settings
 from src.database import Database
 from src.execution import ExecutionEngine
 from src.forward_bars import ForwardBarsProvider, PolygonDailyBars
-from src.intraday import simulate_trade
+from src.intraday import aggregate, simulate_trade
 from src.market_data import AlpacaMarketData, MarketDataProvider
 from src.minute_bars import MinuteBarsProvider, PolygonMinuteBars
 from src.models import PositionState
@@ -317,6 +317,7 @@ class _IntradayVariant:
     entry: float  # entry trigger %
     take_profit_pct: float  # fraction (0.15)
     max_hold: float  # minutes
+    trailing_pct: float  # fraction (0.08)
 
 
 def _intraday_variants(
@@ -324,6 +325,7 @@ def _intraday_variants(
     sweep_entry: list[float] | None,
     sweep_tp: list[float] | None,
     sweep_hold: list[float] | None,
+    sweep_trail: list[float] | None = None,
 ) -> list[_IntradayVariant]:
     """Cartesian grid over whatever dims are swept; unswept dims use .env.
 
@@ -333,18 +335,24 @@ def _intraday_variants(
     entries = sweep_entry or [settings.min_day_change_pct]
     tps = sweep_tp or [settings.take_profit_pct * 100]  # CLI sweeps in %, store fraction
     holds = sweep_hold or [settings.max_hold_minutes]
+    trails = sweep_trail or [settings.trailing_stop_pct * 100]
     out: list[_IntradayVariant] = []
     for e in entries:
         for tp in tps:
             for h in holds:
-                parts = []
-                if sweep_entry:
-                    parts.append(f"e{e:g}")
-                if sweep_tp:
-                    parts.append(f"tp{tp:g}")
-                if sweep_hold:
-                    parts.append(f"h{h:g}")
-                out.append(_IntradayVariant(" ".join(parts) or "baseline", e, tp / 100, h))
+                for tr in trails:
+                    parts = []
+                    if sweep_entry:
+                        parts.append(f"e{e:g}")
+                    if sweep_tp:
+                        parts.append(f"tp{tp:g}")
+                    if sweep_hold:
+                        parts.append(f"h{h:g}")
+                    if sweep_trail:
+                        parts.append(f"tr{tr:g}")
+                    out.append(
+                        _IntradayVariant(" ".join(parts) or "baseline", e, tp / 100, h, tr / 100)
+                    )
     return out
 
 
@@ -356,18 +364,24 @@ def cmd_intraday(
     sweep_entry: list[float] | None = None,
     sweep_tp: list[float] | None = None,
     sweep_hold: list[float] | None = None,
+    sweep_trail: list[float] | None = None,
     cost_pct: float | None = None,
     gross: bool = False,
     throttle_sec: int | None = None,
     source: str | None = None,
+    train_end: str | None = None,
 ) -> int:
     """Intraday hit-and-run backtest: enter at the runner trigger, exit on the
     live rules. Sweep entry-trigger / take-profit / max-hold; net of costs.
+
+    With `train_end` (YYYY-MM-DD), runners split into train (≤) / test (>) and
+    each variant is scored on both — the honest out-of-sample check on whether a
+    train-winning parameter set survives on unseen sessions.
     """
     settings.validate_paper_safety()
     base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
     throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
-    variants = _intraday_variants(settings, sweep_entry, sweep_tp, sweep_hold)
+    variants = _intraday_variants(settings, sweep_entry, sweep_tp, sweep_hold, sweep_trail)
 
     def cost_fn(price: float) -> float:
         return round_trip_cost(
@@ -377,7 +391,8 @@ def cmd_intraday(
     runners = db.get_screened_band(
         settings.min_price, settings.max_price, limit=limit, source=source
     )
-    trades: dict[str, list] = {v.label: [] for v in variants}
+    # per variant: list of (session_date, trade)
+    trades: dict[str, list[tuple[str, Any]]] = {v.label: [] for v in variants}
     fetched = 0
     for i, row in enumerate(runners):
         prev_close = row["last_price"] / (1 + row["day_change_pct"] / 100)
@@ -390,7 +405,7 @@ def cmd_intraday(
                 stop_loss_pct=settings.stop_loss_pct,
                 take_profit_pct=v.take_profit_pct,
                 scale_out_fraction=settings.scale_out_fraction,
-                trailing_stop_pct=settings.trailing_stop_pct,
+                trailing_stop_pct=v.trailing_pct,
                 max_hold_minutes=v.max_hold,
                 exit_spread_pct=settings.exit_spread_pct,
             )
@@ -404,7 +419,7 @@ def cmd_intraday(
                 cost_fn=cost_fn,
             )
             if t.entered:
-                trades[v.label].append(t)
+                trades[v.label].append((row["session_date"], t))
         if throttle and i < len(runners) - 1:
             time.sleep(throttle)
 
@@ -413,25 +428,66 @@ def cmd_intraday(
         f"Intraday hit-and-run over {fetched}/{len(runners)} runner(s) with minute data "
         f"({cost_note}):"
     )
+    if train_end:
+        _print_intraday_oos(variants, trades, train_end)
+    else:
+        _print_intraday_single(variants, trades)
+    return 0
+
+
+def _print_intraday_single(variants: list[_IntradayVariant], trades: dict[str, list]) -> None:
     hdr = f"  {'variant':14s} {'trades':>6s} {'avg%':>7s} {'med%':>7s} {'win%':>6s} {'avgHold':>7s}"
     print(hdr + "   exits")
     for v in variants:
-        ts = trades[v.label]
-        nets = [t.net_return_pct for t in ts]
-        if not nets:
+        a = aggregate([t for _, t in trades[v.label]])
+        if a is None:
             print(f"  {v.label:14s} {0:>6d}")
             continue
-        avg = sum(nets) / len(nets)
-        med = sorted(nets)[len(nets) // 2]
-        win = sum(1 for x in nets if x > 0) / len(nets) * 100
-        avg_hold = sum(t.held_min for t in ts) / len(ts)
-        reasons: dict[str, int] = {}
-        for t in ts:
-            reasons[t.exit_reason or "?"] = reasons.get(t.exit_reason or "?", 0) + 1
-        top = ", ".join(f"{k}:{n}" for k, n in sorted(reasons.items(), key=lambda x: -x[1])[:3])
-        body = f"  {v.label:14s} {len(ts):>6d} {avg:>7.1f} {med:>7.1f} {win:>6.1f} {avg_hold:>7.1f}"
+        top = ", ".join(
+            f"{k}:{n}" for k, n in sorted(a["reasons"].items(), key=lambda x: -x[1])[:3]
+        )
+        body = (
+            f"  {v.label:14s} {a['n']:>6d} {a['avg']:>7.1f} {a['median']:>7.1f} "
+            f"{a['win_rate']:>6.1f} {a['avg_hold']:>7.1f}"
+        )
         print(f"{body}   {top}")
-    return 0
+
+
+def _print_intraday_oos(
+    variants: list[_IntradayVariant], trades: dict[str, list], train_end: str
+) -> None:
+    print(f"  Out-of-sample split at {train_end} (train ≤ / test >):")
+    hdr = (
+        f"  {'variant':14s} | {'nTr':>4s} {'trAvg%':>7s} {'trWin%':>6s} "
+        f"| {'nTe':>4s} {'teAvg%':>7s} {'teWin%':>6s}"
+    )
+    print(hdr)
+    scored = []
+    for v in variants:
+        train = aggregate([t for sd, t in trades[v.label] if sd <= train_end])
+        test = aggregate([t for sd, t in trades[v.label] if sd > train_end])
+        scored.append((v, train, test))
+
+    # mark the train-winner so its test result is easy to read
+    ranked = [s for s in scored if s[1] is not None]
+    best = max(ranked, key=lambda s: s[1]["avg"]) if ranked else None
+    for v, train, test in scored:
+
+        def _c(a, key, w=7):
+            return f"{a[key]:>{w}.1f}" if a else f"{'—':>{w}}"
+
+        mark = " *" if best and v.label == best[0].label else "  "
+        tr_n = train["n"] if train else 0
+        te_n = test["n"] if test else 0
+        print(
+            f"{mark}{v.label:14s} | {tr_n:>4d} {_c(train, 'avg')} {_c(train, 'win_rate', 6)} "
+            f"| {te_n:>4d} {_c(test, 'avg')} {_c(test, 'win_rate', 6)}"
+        )
+    if best:
+        v, train, test = best
+        verdict = "holds up" if (test and test["avg"] > 0) else "collapses (overfit risk)"
+        te = f"{test['avg']:+.1f}% / {test['win_rate']:.0f}% win" if test else "no test trades"
+        print(f"\n  Train-best = {v.label} ({train['avg']:+.1f}% train) -> test {te} — {verdict}.")
 
 
 def cmd_run(
@@ -677,9 +733,13 @@ def main(argv: list[str] | None = None) -> int:
     p_intra.add_argument(
         "--sweep-max-hold", help="comma-separated max-hold minutes (e.g. 15,30,60)"
     )
+    p_intra.add_argument("--sweep-trailing", help="comma-separated trailing-stop %% (e.g. 8,15,25)")
     p_intra.add_argument("--source", help="filter screened source (polygon|watchlist)")
     p_intra.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
     p_intra.add_argument("--gross", action="store_true", help="ignore costs")
+    p_intra.add_argument(
+        "--train-end", help="out-of-sample split date YYYY-MM-DD (train <= / test >)"
+    )
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -718,9 +778,11 @@ def main(argv: list[str] | None = None) -> int:
             sweep_entry=_parse_floats(args.sweep_entry),
             sweep_tp=_parse_floats(args.sweep_take_profit),
             sweep_hold=_parse_floats(args.sweep_max_hold),
+            sweep_trail=_parse_floats(args.sweep_trailing),
             cost_pct=args.cost_pct,
             gross=args.gross,
             source=args.source,
+            train_end=args.train_end,
         )
 
     if args.command == "replay":
