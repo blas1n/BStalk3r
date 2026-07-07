@@ -197,6 +197,19 @@ class PolygonGroupedSource:
             self._cache[date_iso] = self._fetch_raw(date_iso).get("results") or []
         return self._cache[date_iso]
 
+    def fetch_grouped(self, date_iso: str) -> list[dict[str, Any]]:
+        """Public grouped rows for a specific date (cached). [] if no data."""
+        return self._fetch_grouped(date_iso)
+
+    def prev_session_rows(self, date_iso: str) -> list[dict[str, Any]]:
+        """Grouped rows for the most recent trading session before `date_iso`."""
+        start = datetime.fromisoformat(date_iso).date() - timedelta(days=1)
+        for day in _weekdays_back(start, self._max_lookback):
+            rows = self._fetch_grouped(day.isoformat())
+            if rows:
+                return rows
+        return []
+
     def _fetch_raw(self, date_iso: str) -> dict[str, Any]:
         # Free tier 403s on the current/too-recent day (no realtime entitlement)
         # and 404s on non-trading days; treat both as "no data" so the caller
@@ -258,3 +271,49 @@ def polygon_grouped_to_snapshots(
         )
     out.sort(key=lambda s: s.day_change_pct, reverse=True)
     return out[:top_n]
+
+
+def polygon_grouped_crossers(
+    today_rows: list[dict[str, Any]],
+    prev_by_symbol: dict[str, dict[str, Any]],
+    min_price: float,
+    max_price: float,
+    entry_trigger: float,
+) -> list[dict[str, Any]]:
+    """Every stock whose intraday HIGH crossed `entry_trigger` % vs prior close.
+
+    This is the *survivorship-inclusive* universe a live scanner would fire on —
+    unlike the close-based screener it keeps "fizzles" (popped then faded).
+    Band filter is on the entry price estimate (prev_close × (1+trigger)), i.e.
+    what you'd actually pay, so fizzles that closed cheap are still included.
+    """
+    out: list[dict[str, Any]] = []
+    for row in today_rows:
+        symbol = row.get("T")
+        close = row.get("c")
+        high = row.get("h")
+        if not symbol or not close or not high:
+            continue
+        prev = prev_by_symbol.get(symbol)
+        prev_close = prev.get("c") if prev else None
+        if not prev_close:
+            continue
+        chg_high = (high - prev_close) / prev_close * 100
+        if chg_high < entry_trigger:
+            continue
+        entry_est = prev_close * (1 + entry_trigger / 100)
+        if not (min_price <= entry_est <= max_price):
+            continue
+        chg_close = (close - prev_close) / prev_close * 100
+        out.append(
+            {
+                "symbol": symbol,
+                "prev_close": float(prev_close),
+                "close": float(close),
+                "high": float(high),
+                "chg_high": chg_high,
+                "chg_close": chg_close,
+                "is_fizzle": chg_close < entry_trigger,
+            }
+        )
+    return out
