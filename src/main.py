@@ -35,6 +35,7 @@ from src.sources import (
     ScreenBounds,
     SnapshotSource,
     WatchlistSource,
+    polygon_grouped_crossers,
 )
 from src.strategy import EntryParams, ExitParams, evaluate_entry, evaluate_exit
 
@@ -490,6 +491,94 @@ def _print_intraday_oos(
         print(f"\n  Train-best = {v.label} ({train['avg']:+.1f}% train) -> test {te} — {verdict}.")
 
 
+def cmd_crosser(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    minute_bars: MinuteBarsProvider,
+    date: str,
+    sample: int = 150,
+    entry_trigger: float | None = None,
+    cost_pct: float | None = None,
+    gross: bool = False,
+    throttle_sec: int | None = None,
+) -> int:
+    """Survivorship-inclusive backtest: enter EVERY intraday +X% crosser (fizzles
+    included), score with the live exit rules, and split all vs survivors vs
+    fizzles — the honest test of whether the edge survives real detection.
+    """
+    settings.validate_paper_safety()
+    trigger = settings.min_day_change_pct if entry_trigger is None else entry_trigger
+    base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+
+    def cost_fn(price: float) -> float:
+        return round_trip_cost(
+            price, base_cost, settings.replay_cheap_price, settings.replay_cheap_extra_pct
+        )
+
+    today_rows = grouped.fetch_grouped(date)
+    if not today_rows:
+        print(f"No grouped data for {date} (free-tier lag or non-trading day).")
+        return 1
+    prev_by = {r["T"]: r for r in grouped.prev_session_rows(date) if r.get("T")}
+    crossers = polygon_grouped_crossers(
+        today_rows, prev_by, settings.min_price, settings.max_price, trigger
+    )
+    if not crossers:
+        print(f"No +{trigger:g}% intraday crossers for {date}.")
+        return 0
+
+    n_fizzle = sum(1 for c in crossers if c["is_fizzle"])
+    stride = max(1, len(crossers) // sample)
+    picks = crossers[::stride][:sample]  # representative spread across the universe
+
+    ep = settings.build_exit_params()
+    tagged: list[tuple[bool, Any]] = []
+    fetched = 0
+    for i, cr in enumerate(picks):
+        bars = minute_bars.fetch(cr["symbol"], date)
+        if bars:
+            fetched += 1
+            t = simulate_trade(
+                bars,
+                cr["prev_close"],
+                trigger,
+                settings.min_price,
+                settings.max_price,
+                ep,
+                cost_fn=cost_fn,
+            )
+            if t.entered:
+                tagged.append((cr["is_fizzle"], t))
+        if throttle and i < len(picks) - 1:
+            time.sleep(throttle)
+
+    print(
+        f"Crosser backtest {date}: {len(crossers)} intraday +{trigger:g}% crossers "
+        f"({n_fizzle / len(crossers) * 100:.0f}% fizzles), sampled {fetched} with minute data"
+    )
+    print(
+        f"  exit: hold {ep.max_hold_minutes:g}m, tp {ep.take_profit_pct * 100:g}%, "
+        f"trail {ep.trailing_stop_pct * 100:g}%; "
+        f"{'GROSS' if base_cost == 0 else f'net {base_cost:g}%+cheap'}"
+    )
+    groups = [
+        ("ALL crossers", [t for _, t in tagged]),
+        ("survivors", [t for f, t in tagged if not f]),
+        ("fizzles", [t for f, t in tagged if f]),
+    ]
+    print(f"  {'group':14s} {'trades':>6s} {'avg%':>7s} {'med%':>7s} {'win%':>6s}")
+    for name, ts in groups:
+        a = aggregate(ts)
+        if a is None:
+            print(f"  {name:14s} {0:>6d}")
+            continue
+        print(
+            f"  {name:14s} {a['n']:>6d} {a['avg']:>7.1f} {a['median']:>7.1f} {a['win_rate']:>6.1f}"
+        )
+    return 0
+
+
 def cmd_run(
     settings: Settings,
     source: SnapshotSource,
@@ -740,6 +829,18 @@ def main(argv: list[str] | None = None) -> int:
     p_intra.add_argument(
         "--train-end", help="out-of-sample split date YYYY-MM-DD (train <= / test >)"
     )
+    p_cross = sub.add_parser(
+        "crosser", help="survivorship-inclusive backtest (all intraday crossers, fizzles incl.)"
+    )
+    p_cross.add_argument("--date", required=True, help="session date YYYY-MM-DD")
+    p_cross.add_argument(
+        "--sample", type=int, default=150, help="crossers to sample (Polygon calls)"
+    )
+    p_cross.add_argument(
+        "--entry", type=float, help="intraday cross trigger %% (default MIN_DAY_CHANGE_PCT)"
+    )
+    p_cross.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
+    p_cross.add_argument("--gross", action="store_true", help="ignore costs")
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -783,6 +884,27 @@ def main(argv: list[str] | None = None) -> int:
             gross=args.gross,
             source=args.source,
             train_end=args.train_end,
+        )
+
+    if args.command == "crosser":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            minute_bars = PolygonMinuteBars(settings.polygon_api_key)
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_crosser(
+            settings,
+            grouped,
+            minute_bars,
+            date=args.date,
+            sample=args.sample,
+            entry_trigger=args.entry,
+            cost_pct=args.cost_pct,
+            gross=args.gross,
         )
 
     if args.command == "replay":
