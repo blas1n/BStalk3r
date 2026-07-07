@@ -130,3 +130,77 @@ def simulate_trade(
         gross_return_pct=gross,
         net_return_pct=gross - cost(entry_price),
     )
+
+
+@dataclass(frozen=True)
+class ShortTrade:
+    entered: bool
+    entry_price: float = 0.0
+    exit_price: float = 0.0
+    exit_reason: str | None = None
+    held_min: float = 0.0
+    gross_return_pct: float = 0.0
+    net_return_pct: float = 0.0
+    max_adverse_pct: float = 0.0  # worst up-excursion from entry (the squeeze tail)
+
+
+def simulate_short_trade(
+    bars: list[dict[str, Any]],
+    prev_close: float,
+    entry_min_change: float,
+    min_price: float,
+    max_price: float,
+    exit_params: ExitParams,
+    cost_fn: Callable[[float], float] | None = None,
+) -> ShortTrade:
+    """Fade: SHORT the +X% crosser, inverted exits. Stop = adverse UP move
+    (triggered on bar HIGH, filled at the stop level — the squeeze risk);
+    take-profit = favorable DOWN move (bar LOW); trailing tracks the trough.
+
+    `max_adverse_pct` records the worst up-excursion regardless of the stop, so a
+    violent intrabar squeeze (fill far worse than the assumed stop) is visible.
+    """
+    cost = cost_fn or (lambda price: 0.0)
+    entry_idx = reconstruct_entry(bars, prev_close, entry_min_change, min_price, max_price)
+    if entry_idx is None:
+        return ShortTrade(entered=False)
+
+    entry = bars[entry_idx]["close"]
+    entry_time = bars[entry_idx]["ts"]
+    stop_level = entry * (1 + exit_params.stop_loss_pct)  # adverse (up)
+    tp_level = entry * (1 - exit_params.take_profit_pct)  # favorable (down)
+    trough = entry
+    last = len(bars) - 1
+
+    exit_price, reason, held, max_adverse = entry, "session_end", 0.0, 0.0
+    for j in range(entry_idx + 1, len(bars)):
+        bar = bars[j]
+        max_adverse = max(max_adverse, (bar["high"] - entry) / entry * 100)
+        held = (bar["ts"] - entry_time).total_seconds() / 60.0
+        # risk first: adverse up-move (stop) before favorable (take-profit)
+        if bar["high"] >= stop_level:
+            exit_price, reason = stop_level, "stop_loss"
+            break
+        if bar["low"] <= tp_level:
+            exit_price, reason = tp_level, "take_profit"
+            break
+        trough = min(trough, bar["low"])
+        if bar["close"] >= trough * (1 + exit_params.trailing_stop_pct):
+            exit_price, reason = bar["close"], "trailing_stop"
+            break
+        if held >= exit_params.max_hold_minutes or j == last:
+            exit_price = bar["close"]
+            reason = "max_hold" if held >= exit_params.max_hold_minutes else "force_close"
+            break
+
+    gross = (entry - exit_price) / entry * 100  # short profits when price falls
+    return ShortTrade(
+        entered=True,
+        entry_price=entry,
+        exit_price=exit_price,
+        exit_reason=reason,
+        held_min=held,
+        gross_return_pct=gross,
+        net_return_pct=gross - cost(entry),
+        max_adverse_pct=max_adverse,
+    )

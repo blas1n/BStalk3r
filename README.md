@@ -96,6 +96,8 @@ uv run bstalk3r intraday --limit 40 --sweep-entry 3,5,8 --sweep-take-profit 8,12
 uv run bstalk3r intraday --limit 1000 --sweep-entry 3,5,8 --train-end 2026-06-12
 # survivorship-inclusive: enter EVERY intraday +5% crosser (fizzles incl.) — the honest live test
 uv run bstalk3r crosser --date 2026-07-02 --sample 150
+# fade/SHORT the crossers (H-A): short every crosser, measure the squeeze tail
+uv run bstalk3r fade --date 2026-07-02 --sample 150
 ```
 
 ### Getting Alpaca paper keys
