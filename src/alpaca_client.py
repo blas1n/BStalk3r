@@ -48,3 +48,16 @@ class AlpacaTradingClient:
 
     def close_position(self, symbol: str) -> Any:
         return self._client.close_position(symbol)
+
+    def get_shortability(self, symbol: str) -> dict[str, bool]:
+        """Whether `symbol` can be sold short, without leaking the SDK asset type.
+
+        Our target low-float runners are almost always not shortable (probed 9/9,
+        APIError 42210000) — the accumulation job records this per setup.
+        """
+        asset = self._client.get_asset(symbol)
+        return {
+            "tradable": bool(getattr(asset, "tradable", False)),
+            "shortable": bool(getattr(asset, "shortable", False)),
+            "easy_to_borrow": bool(getattr(asset, "easy_to_borrow", False)),
+        }

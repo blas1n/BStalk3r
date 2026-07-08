@@ -6,6 +6,27 @@ from datetime import datetime
 
 from src.database import Database
 from src.models import OrderSide
+from src.short_accumulation import ShortSetupRecord
+
+
+def _short_record(symbol="RUNR", strategy="fade", entry_mode="breakout", net=8.0):
+    return ShortSetupRecord(
+        symbol=symbol,
+        session_date="2026-07-06",
+        strategy=strategy,
+        entry_mode=entry_mode,
+        triggered=True,
+        entry_price=16.05,
+        net_return_pct=net,
+        exit_reason="take_profit",
+        held_min=12.0,
+        max_adverse_pct=3.0,
+        shortable=False,
+        easy_to_borrow=False,
+        run_gain_pct=None,
+        is_fizzle=True,
+        features={"vol_accel": 2.1, "gap_pct": 4.0},
+    )
 
 
 def _db(tmp_path) -> Database:
@@ -34,6 +55,37 @@ def test_insert_signal_and_count(tmp_path):
     )
     assert sid > 0
     assert db.count_signals() == 1
+
+
+def test_record_short_setup_and_count(tmp_path):
+    db = _db(tmp_path)
+    rid = db.record_short_setup(_short_record())
+    assert rid > 0
+    assert db.count_short_setups() == 1
+    rows = db.get_short_setups(session_date="2026-07-06")
+    assert rows[0]["symbol"] == "RUNR"
+    assert rows[0]["strategy"] == "fade"
+    assert rows[0]["shortable"] == 0  # bool -> int
+    assert rows[0]["net_return_pct"] == 8.0
+    # features round-trip as json
+    assert '"vol_accel"' in rows[0]["features_json"]
+
+
+def test_record_short_setup_is_idempotent(tmp_path):
+    db = _db(tmp_path)
+    db.record_short_setup(_short_record(net=8.0))
+    # same (session_date, symbol, strategy, entry_mode) upserts, not duplicates
+    db.record_short_setup(_short_record(net=9.5))
+    assert db.count_short_setups() == 1
+    rows = db.get_short_setups(session_date="2026-07-06")
+    assert rows[0]["net_return_pct"] == 9.5  # latest wins
+
+
+def test_record_short_setup_distinct_strategy_and_mode(tmp_path):
+    db = _db(tmp_path)
+    db.record_short_setup(_short_record(strategy="fade", entry_mode="breakout"))
+    db.record_short_setup(_short_record(strategy="exhaustion", entry_mode="breakdown"))
+    assert db.count_short_setups() == 2
 
 
 def test_order_insert_then_status_update(tmp_path):
