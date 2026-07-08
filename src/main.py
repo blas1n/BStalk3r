@@ -22,7 +22,14 @@ from src.database import Database
 from src.execution import ExecutionEngine
 from src.exhaustion import find_exhaustion_shorts
 from src.forward_bars import ForwardBarsProvider, PolygonDailyBars
-from src.intraday import aggregate, simulate_trade
+from src.intraday import (
+    aggregate,
+    bucket_by_feature,
+    entry_features,
+    reconstruct_entry,
+    simulate_short_trade,
+    simulate_trade,
+)
 from src.market_data import AlpacaMarketData, MarketDataProvider
 from src.minute_bars import MinuteBarsProvider, PolygonMinuteBars
 from src.models import PositionState
@@ -580,6 +587,198 @@ def cmd_crosser(
     return 0
 
 
+_FEATURE_KEYS = (
+    "cum_dollar_vol",
+    "cum_volume",
+    "vol_accel",
+    "minutes_to_cross",
+    "gap_pct",
+    "entry_price",
+)
+
+
+def _pctile(xs: list[float], q: float) -> float:
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    return s[min(len(s) - 1, int(q * len(s)))]
+
+
+def cmd_fade(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    minute_bars: MinuteBarsProvider,
+    date: str,
+    sample: int = 150,
+    entry_trigger: float | None = None,
+    cost_pct: float | None = None,
+    gross: bool = False,
+    throttle_sec: int | None = None,
+) -> int:
+    """Fade/short backtest (H-A): SHORT every intraday +X% crosser with a stop,
+    split all/survivors/fizzles, and quantify the squeeze tail (max adverse
+    up-move) — the strategy killer.
+    """
+    settings.validate_paper_safety()
+    trigger = settings.min_day_change_pct if entry_trigger is None else entry_trigger
+    base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+
+    def cost_fn(price: float) -> float:
+        return round_trip_cost(
+            price, base_cost, settings.replay_cheap_price, settings.replay_cheap_extra_pct
+        )
+
+    today_rows = grouped.fetch_grouped(date)
+    if not today_rows:
+        print(f"No grouped data for {date}.")
+        return 1
+    prev_by = {r["T"]: r for r in grouped.prev_session_rows(date) if r.get("T")}
+    crossers = polygon_grouped_crossers(
+        today_rows, prev_by, settings.min_price, settings.max_price, trigger
+    )
+    if not crossers:
+        print(f"No +{trigger:g}% crossers for {date}.")
+        return 0
+    n_fizzle = sum(1 for c in crossers if c["is_fizzle"])
+    stride = max(1, len(crossers) // sample)
+    picks = crossers[::stride][:sample]
+
+    ep = settings.build_exit_params()
+    tagged: list[tuple[bool, Any]] = []
+    fetched = 0
+    for i, cr in enumerate(picks):
+        bars = minute_bars.fetch(cr["symbol"], date)
+        if bars:
+            fetched += 1
+            t = simulate_short_trade(
+                bars,
+                cr["prev_close"],
+                trigger,
+                settings.min_price,
+                settings.max_price,
+                ep,
+                cost_fn=cost_fn,
+            )
+            if t.entered:
+                tagged.append((cr["is_fizzle"], t))
+        if throttle and i < len(picks) - 1:
+            time.sleep(throttle)
+
+    print(
+        f"Fade/SHORT backtest {date}: {len(crossers)} +{trigger:g}% crossers "
+        f"({n_fizzle / len(crossers) * 100:.0f}% fizzles), sampled {fetched}; "
+        f"stop {ep.stop_loss_pct * 100:g}% tp {ep.take_profit_pct * 100:g}% "
+        f"({'GROSS' if base_cost == 0 else f'net {base_cost:g}%+cheap'})"
+    )
+    groups = [
+        ("ALL crossers", [t for _, t in tagged]),
+        ("survivors", [t for f, t in tagged if not f]),
+        ("fizzles", [t for f, t in tagged if f]),
+    ]
+    print(f"  {'group':14s} {'trades':>6s} {'avg%':>7s} {'med%':>7s} {'win%':>6s}")
+    for name, ts in groups:
+        a = aggregate(ts)
+        if a is None:
+            print(f"  {name:14s} {0:>6d}")
+            continue
+        print(
+            f"  {name:14s} {a['n']:>6d} {a['avg']:>7.1f} {a['median']:>7.1f} {a['win_rate']:>6.1f}"
+        )
+
+    # squeeze tail: worst up-excursion = the real short risk (fill worse than stop)
+    adverse = [t.max_adverse_pct for _, t in tagged]
+    stop_pct = ep.stop_loss_pct * 100
+    if adverse:
+        gapped = sum(1 for a in adverse if a > 2 * stop_pct) / len(adverse) * 100
+        print(
+            f"  --- squeeze tail (max adverse up-move): mean {sum(adverse) / len(adverse):.0f}% "
+            f"p90 {_pctile(adverse, 0.9):.0f}% p99 {_pctile(adverse, 0.99):.0f}% "
+            f"max {max(adverse):.0f}%  |  ran >2x stop (gap-through) {gapped:.0f}%"
+        )
+    return 0
+
+
+def cmd_features(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    minute_bars: MinuteBarsProvider,
+    date: str,
+    sample: int = 150,
+    entry_trigger: float | None = None,
+    cost_pct: float | None = None,
+    gross: bool = False,
+    throttle_sec: int | None = None,
+) -> int:
+    """Do any entry-observable features separate winners from fizzles? For each
+    sampled crosser, compute features AT the cross moment + the trade's net
+    return, then bucket every feature (low/mid/high) to see the return spread.
+    """
+    settings.validate_paper_safety()
+    trigger = settings.min_day_change_pct if entry_trigger is None else entry_trigger
+    base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+
+    def cost_fn(price: float) -> float:
+        return round_trip_cost(
+            price, base_cost, settings.replay_cheap_price, settings.replay_cheap_extra_pct
+        )
+
+    today_rows = grouped.fetch_grouped(date)
+    if not today_rows:
+        print(f"No grouped data for {date}.")
+        return 1
+    prev_by = {r["T"]: r for r in grouped.prev_session_rows(date) if r.get("T")}
+    crossers = polygon_grouped_crossers(
+        today_rows, prev_by, settings.min_price, settings.max_price, trigger
+    )
+    if not crossers:
+        print(f"No +{trigger:g}% crossers for {date}.")
+        return 0
+    stride = max(1, len(crossers) // sample)
+    picks = crossers[::stride][:sample]
+
+    ep = settings.build_exit_params()
+    samples: list[tuple[dict[str, float], float]] = []
+    for i, cr in enumerate(picks):
+        bars = minute_bars.fetch(cr["symbol"], date)
+        if bars:
+            idx = reconstruct_entry(
+                bars, cr["prev_close"], trigger, settings.min_price, settings.max_price
+            )
+            if idx is not None:
+                feats = entry_features(bars, idx, cr["prev_close"])
+                t = simulate_trade(
+                    bars,
+                    cr["prev_close"],
+                    trigger,
+                    settings.min_price,
+                    settings.max_price,
+                    ep,
+                    cost_fn=cost_fn,
+                )
+                if t.entered:
+                    samples.append((feats, t.net_return_pct))
+        if throttle and i < len(picks) - 1:
+            time.sleep(throttle)
+
+    base = sum(r for _, r in samples) / len(samples) if samples else 0.0
+    print(
+        f"Entry-feature separability {date}: {len(samples)} trades, "
+        f"baseline avg {base:+.1f}% (does any feature's high bucket beat this?)"
+    )
+    for key in _FEATURE_KEYS:
+        buckets = bucket_by_feature(samples, key, n_buckets=3)
+        if not buckets:
+            continue
+        cells = " | ".join(
+            f"{b['bucket']}: {b['avg']:+5.1f}% ({b['win_rate']:.0f}%w, n{b['n']})" for b in buckets
+        )
+        spread = buckets[-1]["avg"] - buckets[0]["avg"]
+        print(f"  {key:16s} {cells}   Δ(high-low)={spread:+.1f}%")
+    return 0
+
+
 def _short_stats(rets: list[float]) -> str:
     if not rets:
         return "n=0"
@@ -921,6 +1120,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_cross.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
     p_cross.add_argument("--gross", action="store_true", help="ignore costs")
+    p_fade = sub.add_parser(
+        "fade", help="fade/SHORT backtest: short every crosser, measure the squeeze tail"
+    )
+    p_fade.add_argument("--date", required=True, help="session date YYYY-MM-DD")
+    p_fade.add_argument("--sample", type=int, default=150, help="crossers to sample")
+    p_fade.add_argument("--entry", type=float, help="cross trigger %% (default MIN_DAY_CHANGE_PCT)")
+    p_fade.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
+    p_fade.add_argument("--gross", action="store_true", help="ignore costs")
+    p_feat = sub.add_parser(
+        "features", help="entry-time feature separability (winners vs fizzles at the cross)"
+    )
+    p_feat.add_argument("--date", required=True, help="session date YYYY-MM-DD")
+    p_feat.add_argument("--sample", type=int, default=150, help="crossers to sample")
+    p_feat.add_argument("--entry", type=float, help="cross trigger %% (default MIN_DAY_CHANGE_PCT)")
+    p_feat.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
+    p_feat.add_argument("--gross", action="store_true", help="ignore costs")
     p_exh = sub.add_parser(
         "exhaustion", help="first-red-day / multi-day exhaustion SHORT concept test (H-B)"
     )
@@ -987,6 +1202,48 @@ def main(argv: list[str] | None = None) -> int:
             print(f"❌ {exc}", file=sys.stderr)
             return 2
         return cmd_crosser(
+            settings,
+            grouped,
+            minute_bars,
+            date=args.date,
+            sample=args.sample,
+            entry_trigger=args.entry,
+            cost_pct=args.cost_pct,
+            gross=args.gross,
+        )
+
+    if args.command == "fade":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            minute_bars = PolygonMinuteBars(settings.polygon_api_key)
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_fade(
+            settings,
+            grouped,
+            minute_bars,
+            date=args.date,
+            sample=args.sample,
+            entry_trigger=args.entry,
+            cost_pct=args.cost_pct,
+            gross=args.gross,
+        )
+
+    if args.command == "features":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            minute_bars = PolygonMinuteBars(settings.polygon_api_key)
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_features(
             settings,
             grouped,
             minute_bars,
