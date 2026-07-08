@@ -23,7 +23,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from src.intraday import ShortTrade, simulate_short_trade
+from src.intraday import (
+    ShortTrade,
+    reconstruct_breakdown_entry,
+    simulate_short_trade,
+)
 from src.strategy import ExitParams
 
 
@@ -92,21 +96,42 @@ def simulate_run_end_short(
     max_price: float,
     exit_params: ExitParams,
     cost_fn: Callable[[float], float] | None = None,
+    entry_mode: str = "breakout",
 ) -> IntradayExhaustionShort | None:
-    """Fade the run-end day's intraday up-break via the live short rules.
+    """Short the run-end day via the live short rules; None if it never triggers.
 
-    Returns None if the day never triggers an entry (no look-ahead, no forced
-    fill). `entry_min_change` is measured against `run_end.prev_close`.
+    `entry_min_change` is measured against `run_end.prev_close`. `entry_mode`:
+    - "breakout" (default): fade the intraday up-break (short into strength —
+      momentum-fighting; empirically the losing entry).
+    - "breakdown": short the loss of the prior close (down-break — the
+      exhaustion/first-red-day thesis; shorting weakness).
     """
-    trade = simulate_short_trade(
-        minute_bars,
-        run_end.prev_close,
-        entry_min_change,
-        min_price,
-        max_price,
-        exit_params,
-        cost_fn,
-    )
+    if entry_mode == "breakdown":
+        idx = reconstruct_breakdown_entry(
+            minute_bars, run_end.prev_close, entry_min_change, min_price, max_price
+        )
+        if idx is None:
+            return None  # never lost the prior close — no breakdown short
+        trade = simulate_short_trade(
+            minute_bars,
+            run_end.prev_close,
+            entry_min_change,
+            min_price,
+            max_price,
+            exit_params,
+            cost_fn,
+            entry_idx=idx,
+        )
+    else:
+        trade = simulate_short_trade(
+            minute_bars,
+            run_end.prev_close,
+            entry_min_change,
+            min_price,
+            max_price,
+            exit_params,
+            cost_fn,
+        )
     if not trade.entered:
         return None
     return IntradayExhaustionShort(

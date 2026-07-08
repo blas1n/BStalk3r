@@ -869,6 +869,7 @@ def cmd_exhaustion_intraday(
     run_gain: float = 50.0,
     entry_trigger: float = 2.0,
     sample: int = 150,
+    entry_mode: str = "breakout",
     cost_pct: float | None = None,
     gross: bool = False,
     throttle_sec: int | None = None,
@@ -876,10 +877,11 @@ def cmd_exhaustion_intraday(
     """Exhaustion SHORT v2 — realistic intraday entry, no EOD/look-ahead bias.
 
     Candidate = the session AFTER a parabolic run (run over `run_days` ≥
-    `run_gain`%), regardless of its close. Entry is the first minute-bar up-break
-    of `entry_trigger`% above the run-end close; exits via the live short rules.
-    Green-reversal days that fade are included; days that never break up don't
-    trade. This is the tradeable counterpart to `exhaustion` (v1).
+    `run_gain`%), regardless of its close. Entry (`entry_mode`) is the first
+    minute-bar break of `entry_trigger`% vs the run-end close — "breakout" fades
+    the up-push (short into strength), "breakdown" shorts the loss of the prior
+    close (the first-red-day thesis). Exits via the live short rules; days that
+    never trigger don't trade. Tradeable counterpart to `exhaustion` (v1).
     """
     settings.validate_paper_safety()
     base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
@@ -936,16 +938,18 @@ def cmd_exhaustion_intraday(
                 settings.max_price,
                 ep,
                 cost_fn=cost_fn,
+                entry_mode=entry_mode,
             )
             if res is not None:
                 trades.append(res)
         if throttle and i < len(picks) - 1:
             time.sleep(throttle)
 
+    _dir = "up-break fade" if entry_mode == "breakout" else "prior-close breakdown"
     print(
-        f"Exhaustion SHORT v2 {start}..{end} ({n_sessions} sessions): run ≥{run_gain:g}% over "
-        f"{run_days}d -> next-day +{entry_trigger:g}% intraday break, live exits. "
-        f"{len(candidates)} candidates, sampled {fetched}, {len(trades)} triggered "
+        f"Exhaustion SHORT v2 [{entry_mode}: {_dir}] {start}..{end} ({n_sessions} sessions): "
+        f"run ≥{run_gain:g}% over {run_days}d -> next-day {entry_trigger:g}% intraday break, "
+        f"live exits. {len(candidates)} candidates, sampled {fetched}, {len(trades)} triggered "
         f"({'GROSS' if base_cost == 0 else f'net {base_cost:g}%+cheap'})"
     )
     agg = aggregate([r.trade for r in trades])
@@ -1277,6 +1281,12 @@ def main(argv: list[str] | None = None) -> int:
         "--entry", type=float, default=2.0, help="intraday up-break %% above run-end close"
     )
     p_exh2.add_argument("--sample", type=int, default=150, help="max candidates to minute-fetch")
+    p_exh2.add_argument(
+        "--mode",
+        choices=["breakout", "breakdown"],
+        default="breakout",
+        help="breakout=fade the up-push; breakdown=short loss of prior close (first-red-day)",
+    )
     p_exh2.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
     p_exh2.add_argument("--gross", action="store_true", help="ignore costs")
 
@@ -1428,6 +1438,7 @@ def main(argv: list[str] | None = None) -> int:
             run_gain=args.run_gain,
             entry_trigger=args.entry,
             sample=args.sample,
+            entry_mode=args.mode,
             cost_pct=args.cost_pct,
             gross=args.gross,
         )

@@ -116,6 +116,69 @@ def test_no_trigger_day_returns_none():
     assert res is None
 
 
+def test_breakdown_mode_shorts_the_downside_break_not_the_up_break():
+    # Run ended at close 15. Next day opens GREEN (never breaks +5% up over 15 by
+    # much) but rolls over and breaks DOWN through 15 by 2% (-> 14.7), then fades.
+    # breakout mode would enter on the up-push; breakdown mode enters on the loss
+    # of the prior close and rides it down.
+    ends = qualifying_run_ends(
+        {
+            "R": [
+                _d("2026-07-02", 10, 10, 10, 10.0),
+                _d("2026-07-03", 15, 15, 15, 15.0),
+                _d("2026-07-06", 15.2, 15.3, 12, 12.5),
+            ]
+        },
+        run_days=1,
+        run_min_gain_pct=40.0,
+        min_price=1,
+        max_price=50,
+    )
+    # opens 15.2, drifts, breaks down through 14.7 (-2% of 15) then fades to 13.0
+    bars = _bars(15.0, [15.2, 15.1, 14.6, 14.0, 13.0])
+    res = simulate_run_end_short(
+        ends[0],
+        bars,
+        entry_min_change=2.0,
+        min_price=1,
+        max_price=50,
+        exit_params=_EXITS,
+        entry_mode="breakdown",
+    )
+    assert isinstance(res, IntradayExhaustionShort)
+    assert res.trade.entered is True
+    assert abs(res.trade.entry_price - 14.6) < 1e-9  # entered on the downside break
+    assert res.trade.net_return_pct > 0  # rode the breakdown down
+
+
+def test_breakdown_mode_no_trade_if_prior_close_holds():
+    ends = qualifying_run_ends(
+        {
+            "R": [
+                _d("2026-07-02", 10, 10, 10, 10.0),
+                _d("2026-07-03", 15, 15, 15, 15.0),
+                _d("2026-07-06", 15.2, 16, 15, 15.8),
+            ]
+        },
+        run_days=1,
+        run_min_gain_pct=40.0,
+        min_price=1,
+        max_price=50,
+    )
+    # holds above 15 all day -> never breaks down -> no short in breakdown mode
+    bars = _bars(15.0, [15.2, 15.5, 16.0, 15.6])
+    res = simulate_run_end_short(
+        ends[0],
+        bars,
+        entry_min_change=2.0,
+        min_price=1,
+        max_price=50,
+        exit_params=_EXITS,
+        entry_mode="breakdown",
+    )
+    assert res is None
+
+
 def test_no_setup_if_run_too_small():
     ends = qualifying_run_ends(
         {
