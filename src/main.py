@@ -1058,10 +1058,17 @@ def cmd_accumulate_shorts(
         )
         if e.short_day_date == date
     ]
-    setups += exhaustion_setups(run_ends, exh_trigger, exh_mode)
+    exh = exhaustion_setups(run_ends, exh_trigger, exh_mode)
 
-    if len(setups) > sample:
-        setups = setups[:sample]
+    # Exhaustion setups are rare (a few/day) — keep them all so the thousands of
+    # daily fade crossers can't crowd them out. Fade fills the remaining budget,
+    # stride-sampled across the universe (not just the first N).
+    fade = setups
+    fade_budget = max(0, sample - len(exh))
+    if len(fade) > fade_budget:
+        stride = max(1, len(fade) // fade_budget) if fade_budget else len(fade) + 1
+        fade = fade[::stride][:fade_budget]
+    setups = fade + exh
 
     ep = settings.build_exit_params()
     recorded = 0

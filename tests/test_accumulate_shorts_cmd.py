@@ -131,6 +131,42 @@ def test_accumulate_shorts_records_both_strategies(tmp_path, capsys):
     assert "shortable" in out.lower()
 
 
+def test_exhaustion_not_starved_by_fade_sample_cap(tmp_path):
+    # Many fade crossers + one exhaustion run-end, with a tiny sample budget.
+    # Exhaustion (rare) must survive the cap, not be crowded out by fade volume.
+    # prev session (07-02) carries the run-end + the crossers' prior closes
+    prev = [{"T": f"F{i}", "o": 10, "h": 10, "l": 10, "c": 10.0} for i in range(5)]
+    prev.append({"T": "EXH", "o": 15, "h": 15, "l": 15, "c": 15.0})  # +50% run end
+    today = [{"T": f"F{i}", "o": 10, "h": 10.6, "l": 9, "c": 9.0} for i in range(5)]
+    today.append({"T": "EXH", "o": 15, "h": 15.2, "l": 12, "c": 12.5})
+    by_date = {
+        "2026-07-01": [{"T": "EXH", "o": 10, "h": 10, "l": 10, "c": 10.0}],  # run start
+        "2026-07-02": prev,
+        "2026-07-03": today,
+    }
+    grouped = _FakeGrouped(by_date)
+    fade_bar = _bars([(10.0, 10.0, 10.0), (10.6, 10.6, 10.6), (9.5, 9.4, 9.5)])
+    exh_bar = _bars([(15.2, 15.2, 15.2), (14.6, 14.6, 14.6), (13.0, 12.9, 13.0)])
+    minutes = _FakeMinutes({**{f"F{i}": fade_bar for i in range(5)}, "EXH": exh_bar})
+    s = _settings(tmp_path)
+    db = Database(s.db_path)
+    db.init_schema()
+    main_mod.cmd_accumulate_shorts(
+        s,
+        grouped,
+        minutes,
+        _FakeShortability({}),
+        db,
+        date="2026-07-03",
+        run_days=1,
+        run_gain=40.0,
+        sample=2,
+        throttle_sec=0,
+    )
+    strategies = {r["strategy"] for r in db.get_short_setups(session_date="2026-07-03")}
+    assert "exhaustion" in strategies  # survived the cap despite 5 fade crossers
+
+
 def test_accumulate_shorts_is_idempotent(tmp_path):
     by_date = {
         "2026-07-02": [{"T": "FAD", "o": 10, "h": 10, "l": 10, "c": 10.0}],
