@@ -6,7 +6,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from src.intraday import IntradayTrade, aggregate, reconstruct_entry, simulate_trade
+from src.intraday import (
+    IntradayTrade,
+    aggregate,
+    reconstruct_breakdown_entry,
+    reconstruct_entry,
+    simulate_short_trade,
+    simulate_trade,
+)
 from src.strategy import ExitParams
 
 T0 = datetime(2026, 6, 9, 13, 30, tzinfo=UTC)  # 09:30 ET
@@ -52,6 +59,47 @@ def test_no_entry_if_never_crosses():
 def test_entry_respects_price_band():
     bars = _bars([60.0, 61.0])  # +500% but above max_price 50
     assert reconstruct_entry(bars, PREV_CLOSE, 5.0, 1.0, 50.0) is None
+
+
+# ---- breakdown entry (down-trigger, for exhaustion shorts) ----
+
+
+def test_breakdown_entry_at_first_downside_break():
+    # ref 10.0; short-trigger when price breaks 2% BELOW -> close <= 9.8.
+    # Opens green (10.5), then breaks down through 9.8 at idx 3.
+    bars = _bars([10.5, 10.2, 9.9, 9.7, 9.5])
+    idx = reconstruct_breakdown_entry(
+        bars, ref_level=10.0, break_pct=2.0, min_price=1.0, max_price=50.0
+    )
+    assert idx == 3
+
+
+def test_breakdown_entry_none_if_only_goes_up():
+    bars = _bars([10.5, 11.0, 12.0])  # never breaks down through 9.8
+    assert reconstruct_breakdown_entry(bars, 10.0, 2.0, 1.0, 50.0) is None
+
+
+def test_breakdown_entry_respects_price_band():
+    bars = _bars([0.5, 0.4])  # broke down hard but below min_price 1.0
+    assert reconstruct_breakdown_entry(bars, 1.0, 2.0, 1.0, 50.0) is None
+
+
+def test_simulate_short_trade_honors_injected_entry_idx():
+    # Injecting entry_idx bypasses the up-cross finder: enter at idx 2 (close 9.7),
+    # price keeps falling -> profitable short regardless of entry_min_change.
+    bars = _bars([10.5, 10.0, 9.7, 9.0, 8.5])
+    t = simulate_short_trade(
+        bars,
+        10.0,
+        entry_min_change=99.0,
+        min_price=1.0,
+        max_price=50.0,
+        exit_params=EXIT,
+        entry_idx=2,
+    )
+    assert t.entered is True
+    assert abs(t.entry_price - 9.7) < 1e-9
+    assert t.gross_return_pct > 0  # shorted 9.7, fell
 
 
 # ---- exit simulation (reusing evaluate_exit) ----

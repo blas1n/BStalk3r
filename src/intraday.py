@@ -136,6 +136,30 @@ def reconstruct_entry(
     return None
 
 
+def reconstruct_breakdown_entry(
+    bars: list[dict[str, Any]],
+    ref_level: float,
+    break_pct: float,
+    min_price: float,
+    max_price: float,
+) -> int | None:
+    """Index of the first bar that breaks DOWN through `ref_level`, else None.
+
+    The short-side mirror of `reconstruct_entry`: trigger = price ≥ `break_pct`%
+    *below* `ref_level` (e.g. losing the prior close / a breakdown), price in
+    band. This is the exhaustion/first-red-day entry — shorting weakness, not the
+    up-break — so it fires only once the runner actually rolls over.
+    """
+    if ref_level <= 0:
+        return None
+    for i, bar in enumerate(bars):
+        price = bar["close"]
+        drop = (ref_level - price) / ref_level * 100
+        if drop >= break_pct and min_price <= price <= max_price:
+            return i
+    return None
+
+
 def simulate_trade(
     bars: list[dict[str, Any]],
     prev_close: float,
@@ -210,6 +234,7 @@ def simulate_short_trade(
     max_price: float,
     exit_params: ExitParams,
     cost_fn: Callable[[float], float] | None = None,
+    entry_idx: int | None = None,
 ) -> ShortTrade:
     """Fade: SHORT the +X% crosser, inverted exits. Stop = adverse UP move
     (triggered on bar HIGH, filled at the stop level — the squeeze risk);
@@ -217,9 +242,14 @@ def simulate_short_trade(
 
     `max_adverse_pct` records the worst up-excursion regardless of the stop, so a
     violent intrabar squeeze (fill far worse than the assumed stop) is visible.
+
+    Entry defaults to the first +`entry_min_change`% up-cross; pass `entry_idx` to
+    inject a caller-computed entry (e.g. a breakdown trigger) and reuse the exit
+    walk unchanged.
     """
     cost = cost_fn or (lambda price: 0.0)
-    entry_idx = reconstruct_entry(bars, prev_close, entry_min_change, min_price, max_price)
+    if entry_idx is None:
+        entry_idx = reconstruct_entry(bars, prev_close, entry_min_change, min_price, max_price)
     if entry_idx is None:
         return ShortTrade(entered=False)
 

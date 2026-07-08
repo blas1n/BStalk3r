@@ -21,6 +21,7 @@ from src.config import Settings, load_settings
 from src.database import Database
 from src.execution import ExecutionEngine
 from src.exhaustion import find_exhaustion_shorts
+from src.exhaustion_intraday import qualifying_run_ends, simulate_run_end_short
 from src.forward_bars import ForwardBarsProvider, PolygonDailyBars
 from src.intraday import (
     aggregate,
@@ -858,6 +859,126 @@ def cmd_exhaustion(
     return 0
 
 
+def cmd_exhaustion_intraday(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    minute_bars: MinuteBarsProvider,
+    start: str,
+    end: str,
+    run_days: int = 3,
+    run_gain: float = 50.0,
+    entry_trigger: float = 2.0,
+    sample: int = 150,
+    entry_mode: str = "breakout",
+    cost_pct: float | None = None,
+    gross: bool = False,
+    throttle_sec: int | None = None,
+) -> int:
+    """Exhaustion SHORT v2 — realistic intraday entry, no EOD/look-ahead bias.
+
+    Candidate = the session AFTER a parabolic run (run over `run_days` ≥
+    `run_gain`%), regardless of its close. Entry (`entry_mode`) is the first
+    minute-bar break of `entry_trigger`% vs the run-end close — "breakout" fades
+    the up-push (short into strength), "breakdown" shorts the loss of the prior
+    close (the first-red-day thesis). Exits via the live short rules; days that
+    never trigger don't trade. Tradeable counterpart to `exhaustion` (v1).
+    """
+    settings.validate_paper_safety()
+    base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+
+    def cost_fn(price: float) -> float:
+        return round_trip_cost(
+            price, base_cost, settings.replay_cheap_price, settings.replay_cheap_extra_pct
+        )
+
+    daily: dict[str, list[dict[str, Any]]] = {}
+    day = datetime.fromisoformat(start).date()
+    end_d = datetime.fromisoformat(end).date()
+    n_sessions = 0
+    while day <= end_d:
+        if day.weekday() < 5:
+            rows = grouped.fetch_grouped(day.isoformat())
+            if rows:
+                n_sessions += 1
+                for r in rows:
+                    sym = r.get("T")
+                    if sym and r.get("c"):
+                        daily.setdefault(sym, []).append(
+                            {
+                                "date": day.isoformat(),
+                                "open": r.get("o"),
+                                "high": r.get("h"),
+                                "low": r.get("l"),
+                                "close": r["c"],
+                            }
+                        )
+                if throttle:
+                    time.sleep(throttle)
+        day += timedelta(days=1)
+
+    candidates = qualifying_run_ends(
+        daily, run_days, run_gain, settings.min_price, settings.max_price
+    )
+    stride = max(1, len(candidates) // sample) if candidates else 1
+    picks = candidates[::stride][:sample]
+
+    ep = settings.build_exit_params()
+    trades: list[Any] = []
+    fetched = 0
+    for i, cand in enumerate(picks):
+        bars = minute_bars.fetch(cand.symbol, cand.short_day_date)
+        if bars:
+            fetched += 1
+            res = simulate_run_end_short(
+                cand,
+                bars,
+                entry_trigger,
+                settings.min_price,
+                settings.max_price,
+                ep,
+                cost_fn=cost_fn,
+                entry_mode=entry_mode,
+            )
+            if res is not None:
+                trades.append(res)
+        if throttle and i < len(picks) - 1:
+            time.sleep(throttle)
+
+    _dir = "up-break fade" if entry_mode == "breakout" else "prior-close breakdown"
+    print(
+        f"Exhaustion SHORT v2 [{entry_mode}: {_dir}] {start}..{end} ({n_sessions} sessions): "
+        f"run ≥{run_gain:g}% over {run_days}d -> next-day {entry_trigger:g}% intraday break, "
+        f"live exits. {len(candidates)} candidates, sampled {fetched}, {len(trades)} triggered "
+        f"({'GROSS' if base_cost == 0 else f'net {base_cost:g}%+cheap'})"
+    )
+    agg = aggregate([r.trade for r in trades])
+    if agg is None:
+        print("  (no triggered shorts — raise date range / lower trigger)")
+        return 0
+    print(
+        f"  intraday short:  n={agg['n']:>3d}  avg {agg['avg']:+5.1f}%  "
+        f"med {agg['median']:+5.1f}%  win {agg['win_rate']:.0f}%  "
+        f"avg_hold {agg['avg_hold']:.0f}m"
+    )
+    print(f"  exits: {agg['reasons']}")
+    adverse = [r.trade.max_adverse_pct for r in trades]
+    if adverse:
+        print(
+            f"  squeeze tail (max adverse up-move): mean {sum(adverse) / len(adverse):.0f}% "
+            f"p90 {_pctile(adverse, 0.9):.0f}%  max {max(adverse):.0f}%"
+        )
+    print("  top setups by run gain:")
+    for r in sorted(trades, key=lambda x: -x.run_gain_pct)[:8]:
+        t = r.trade
+        print(
+            f"    {r.symbol:6s} run+{r.run_gain_pct:5.0f}% {r.short_day_date}  "
+            f"short {t.net_return_pct:+5.1f}%  ({t.exit_reason}, {t.held_min:.0f}m, "
+            f"adverse {t.max_adverse_pct:.0f}%)"
+        )
+    return 0
+
+
 def cmd_run(
     settings: Settings,
     source: SnapshotSource,
@@ -1146,6 +1267,28 @@ def main(argv: list[str] | None = None) -> int:
     p_exh.add_argument("--fwd-days", type=int, default=1, help="swing horizon (sessions)")
     p_exh.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
     p_exh.add_argument("--gross", action="store_true", help="ignore costs")
+    p_exh2 = sub.add_parser(
+        "exhaustion-intraday",
+        help="exhaustion SHORT v2 — realistic intraday entry, no EOD/look-ahead bias (H-B v2)",
+    )
+    p_exh2.add_argument("--start", required=True, help="range start YYYY-MM-DD")
+    p_exh2.add_argument("--end", required=True, help="range end YYYY-MM-DD")
+    p_exh2.add_argument("--run-days", type=int, default=2, help="parabolic run length (sessions)")
+    p_exh2.add_argument(
+        "--run-gain", type=float, default=30.0, help="min run gain %% over run-days"
+    )
+    p_exh2.add_argument(
+        "--entry", type=float, default=2.0, help="intraday up-break %% above run-end close"
+    )
+    p_exh2.add_argument("--sample", type=int, default=150, help="max candidates to minute-fetch")
+    p_exh2.add_argument(
+        "--mode",
+        choices=["breakout", "breakdown"],
+        default="breakout",
+        help="breakout=fade the up-push; breakdown=short loss of prior close (first-red-day)",
+    )
+    p_exh2.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
+    p_exh2.add_argument("--gross", action="store_true", help="ignore costs")
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -1271,6 +1414,31 @@ def main(argv: list[str] | None = None) -> int:
             run_days=args.run_days,
             run_gain=args.run_gain,
             fwd_days=args.fwd_days,
+            cost_pct=args.cost_pct,
+            gross=args.gross,
+        )
+
+    if args.command == "exhaustion-intraday":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            minute_bars = PolygonMinuteBars(settings.polygon_api_key)
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_exhaustion_intraday(
+            settings,
+            grouped,
+            minute_bars,
+            start=args.start,
+            end=args.end,
+            run_days=args.run_days,
+            run_gain=args.run_gain,
+            entry_trigger=args.entry,
+            sample=args.sample,
+            entry_mode=args.mode,
             cost_pct=args.cost_pct,
             gross=args.gross,
         )
