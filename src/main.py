@@ -980,19 +980,43 @@ def cmd_exhaustion_intraday(
     return 0
 
 
+def _split_budget(n_a: int, n_b: int, total: int) -> tuple[int, int]:
+    """Split a fetch budget of `total` fairly between two pools of sizes n_a/n_b.
+
+    Each pool gets up to half; leftover from a pool that can't fill its half is
+    handed to the other. Total taken == min(total, n_a + n_b).
+    """
+    half = total // 2
+    a = min(n_a, half)
+    b = min(n_b, total - a)
+    a = min(n_a, total - b)  # reclaim if b under-filled
+    return a, b
+
+
+def _stride_take(items: list[Any], k: int) -> list[Any]:
+    """At most `k` items, stride-sampled across `items` (not just the first k)."""
+    if k <= 0:
+        return []
+    if len(items) <= k:
+        return items
+    stride = max(1, len(items) // k)
+    return items[::stride][:k]
+
+
 def cmd_accumulate_shorts(
     settings: Settings,
     grouped: PolygonGroupedSource,
     minute_bars: MinuteBarsProvider,
     shortability: Any,
     db: Database,
-    date: str,
+    date: str | None = None,
     run_days: int = 2,
     run_gain: float = 30.0,
     fade_trigger: float | None = None,
     exh_trigger: float = 2.0,
     exh_mode: str = "breakdown",
     sample: int = 200,
+    lag_days: int = 1,
     cost_pct: float | None = None,
     gross: bool = False,
     throttle_sec: int | None = None,
@@ -1000,12 +1024,20 @@ def cmd_accumulate_shorts(
     """Accumulate a forward, out-of-time dataset of *would-be* short outcomes.
 
     Alpaca can't short our target runners, so instead of paper-trading we record,
-    per short setup (H-A fade crosser + H-B exhaustion run-end) for session
-    `date`: the entry-time features, the simulated intraday short outcome (live
+    per short setup (H-A fade crosser + H-B exhaustion run-end) for the target
+    session: the entry-time features, the simulated intraday short outcome (live
     short rules), and the live shortable/easy_to_borrow status. Idempotent per
     (session, symbol, strategy, entry_mode) so re-runs refresh in place.
+
+    `date=None` auto-resolves the latest available session ≥ `lag_days` old (for
+    the unattended daily job — no hardcoded date, robust to weekends/holidays/lag).
     """
     settings.validate_paper_safety()
+    if date is None:
+        date = grouped.latest_session(lag_days=lag_days)
+        if not date:
+            print("accumulate-shorts: no session with grouped data in lookback window")
+            return 0
     trigger = settings.min_day_change_pct if fade_trigger is None else fade_trigger
     base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
     throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
@@ -1060,15 +1092,12 @@ def cmd_accumulate_shorts(
     ]
     exh = exhaustion_setups(run_ends, exh_trigger, exh_mode)
 
-    # Exhaustion setups are rare (a few/day) — keep them all so the thousands of
-    # daily fade crossers can't crowd them out. Fade fills the remaining budget,
-    # stride-sampled across the universe (not just the first N).
-    fade = setups
-    fade_budget = max(0, sample - len(exh))
-    if len(fade) > fade_budget:
-        stride = max(1, len(fade) // fade_budget) if fade_budget else len(fade) + 1
-        fade = fade[::stride][:fade_budget]
-    setups = fade + exh
+    # Split the minute-fetch budget fairly between the two strategies so neither
+    # (fade's thousands of crossers, or a high-parabolic day's many run-ends) can
+    # crowd out the other or blow past `sample`. Each side is stride-sampled
+    # across its universe to its share.
+    n_fade, n_exh = _split_budget(len(setups), len(exh), sample)
+    setups = _stride_take(setups, n_fade) + _stride_take(exh, n_exh)
 
     ep = settings.build_exit_params()
     recorded = 0
@@ -1426,7 +1455,12 @@ def main(argv: list[str] | None = None) -> int:
         "accumulate-shorts",
         help="record would-be short outcomes + shortable status for a session (forward dataset)",
     )
-    p_acc.add_argument("--date", required=True, help="target session YYYY-MM-DD (the short day)")
+    p_acc.add_argument(
+        "--date", help="target session YYYY-MM-DD (default: latest available, lagged)"
+    )
+    p_acc.add_argument(
+        "--lag-days", type=int, default=1, help="min session age when auto-resolving --date"
+    )
     p_acc.add_argument("--run-days", type=int, default=2, help="exhaustion run length (sessions)")
     p_acc.add_argument("--run-gain", type=float, default=30.0, help="min run gain %% over run-days")
     p_acc.add_argument(
@@ -1624,6 +1658,7 @@ def main(argv: list[str] | None = None) -> int:
             exh_trigger=args.exh_trigger,
             exh_mode=args.exh_mode,
             sample=args.sample,
+            lag_days=args.lag_days,
             cost_pct=args.cost_pct,
             gross=args.gross,
         )
