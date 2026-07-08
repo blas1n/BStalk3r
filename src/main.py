@@ -986,13 +986,14 @@ def cmd_accumulate_shorts(
     minute_bars: MinuteBarsProvider,
     shortability: Any,
     db: Database,
-    date: str,
+    date: str | None = None,
     run_days: int = 2,
     run_gain: float = 30.0,
     fade_trigger: float | None = None,
     exh_trigger: float = 2.0,
     exh_mode: str = "breakdown",
     sample: int = 200,
+    lag_days: int = 1,
     cost_pct: float | None = None,
     gross: bool = False,
     throttle_sec: int | None = None,
@@ -1000,12 +1001,20 @@ def cmd_accumulate_shorts(
     """Accumulate a forward, out-of-time dataset of *would-be* short outcomes.
 
     Alpaca can't short our target runners, so instead of paper-trading we record,
-    per short setup (H-A fade crosser + H-B exhaustion run-end) for session
-    `date`: the entry-time features, the simulated intraday short outcome (live
+    per short setup (H-A fade crosser + H-B exhaustion run-end) for the target
+    session: the entry-time features, the simulated intraday short outcome (live
     short rules), and the live shortable/easy_to_borrow status. Idempotent per
     (session, symbol, strategy, entry_mode) so re-runs refresh in place.
+
+    `date=None` auto-resolves the latest available session ≥ `lag_days` old (for
+    the unattended daily job — no hardcoded date, robust to weekends/holidays/lag).
     """
     settings.validate_paper_safety()
+    if date is None:
+        date = grouped.latest_session(lag_days=lag_days)
+        if not date:
+            print("accumulate-shorts: no session with grouped data in lookback window")
+            return 0
     trigger = settings.min_day_change_pct if fade_trigger is None else fade_trigger
     base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
     throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
@@ -1426,7 +1435,12 @@ def main(argv: list[str] | None = None) -> int:
         "accumulate-shorts",
         help="record would-be short outcomes + shortable status for a session (forward dataset)",
     )
-    p_acc.add_argument("--date", required=True, help="target session YYYY-MM-DD (the short day)")
+    p_acc.add_argument(
+        "--date", help="target session YYYY-MM-DD (default: latest available, lagged)"
+    )
+    p_acc.add_argument(
+        "--lag-days", type=int, default=1, help="min session age when auto-resolving --date"
+    )
     p_acc.add_argument("--run-days", type=int, default=2, help="exhaustion run length (sessions)")
     p_acc.add_argument("--run-gain", type=float, default=30.0, help="min run gain %% over run-days")
     p_acc.add_argument(
@@ -1624,6 +1638,7 @@ def main(argv: list[str] | None = None) -> int:
             exh_trigger=args.exh_trigger,
             exh_mode=args.exh_mode,
             sample=args.sample,
+            lag_days=args.lag_days,
             cost_pct=args.cost_pct,
             gross=args.gross,
         )

@@ -201,6 +201,16 @@ class PolygonGroupedSource:
         """Public grouped rows for a specific date (cached). [] if no data."""
         return self._fetch_grouped(date_iso)
 
+    def latest_session(self, lag_days: int = 0, _today: date | None = None) -> str:
+        """Most recent trading session (≤ today − `lag_days`) that has grouped
+        data, else "". `lag_days` gives free-tier minute aggregates time to land
+        before we target a session; `_today` is injectable for tests."""
+        start = (_today or datetime.now(_ET).date()) - timedelta(days=lag_days)
+        for day in _weekdays_back(start, self._max_lookback):
+            if self._fetch_grouped(day.isoformat()):
+                return day.isoformat()
+        return ""
+
     def prev_session_rows(self, date_iso: str) -> list[dict[str, Any]]:
         """Grouped rows for the most recent trading session before `date_iso`."""
         start = datetime.fromisoformat(date_iso).date() - timedelta(days=1)

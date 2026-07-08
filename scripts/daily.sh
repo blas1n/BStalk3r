@@ -2,8 +2,11 @@
 # BStalk3r daily accumulation job (run by launchd, or manually).
 #
 # Accumulates the day's runner universe and backfills forward outcomes:
-#   scan   -> persist the latest session's screened runners (Polygon EOD)
-#   track  -> compute forward returns for runners now old enough
+#   scan              -> persist the latest session's screened runners (Polygon EOD)
+#   track             -> compute forward returns for runners now old enough
+#   accumulate-shorts -> record would-be SHORT outcomes + Alpaca shortable status
+#                        (forward OOS dataset; the runners aren't shortable, so we
+#                         simulate rather than paper-trade)
 #
 # Location-independent: derives the project dir from this script's path, so it
 # works from `main` or any worktree. Logs to logs/daily-YYYYMMDD.log.
@@ -33,6 +36,11 @@ LOG="logs/daily-$(date +%Y%m%d).log"
 
   echo "--- track (backfill forward outcomes) ---"
   uv run bstalk3r track
+
+  echo "--- accumulate-shorts (forward SHORT dataset, auto-resolve session) ---"
+  # Non-fatal: short accumulation must never block scan/track. lag 2 gives free-
+  # tier minute aggregates time to land before we target a session.
+  uv run bstalk3r accumulate-shorts --lag-days 2 || echo "accumulate-shorts failed (non-fatal)"
 
   echo "=== done :: $(date '+%H:%M:%S') ==="
 } >> "$LOG" 2>&1

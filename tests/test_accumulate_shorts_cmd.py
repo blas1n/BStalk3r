@@ -33,8 +33,12 @@ def _bars(rows):  # (high, low, close)
 class _FakeGrouped:
     """Date-aware grouped source: fetch_grouped(d) -> that day's rows."""
 
-    def __init__(self, by_date):
+    def __init__(self, by_date, latest=None):
         self._by = by_date
+        self._latest = latest
+
+    def latest_session(self, lag_days=0, _today=None):
+        return self._latest or ""
 
     def fetch_grouped(self, date):
         return self._by.get(date, [])
@@ -165,6 +169,39 @@ def test_exhaustion_not_starved_by_fade_sample_cap(tmp_path):
     )
     strategies = {r["strategy"] for r in db.get_short_setups(session_date="2026-07-03")}
     assert "exhaustion" in strategies  # survived the cap despite 5 fade crossers
+
+
+def test_accumulate_shorts_auto_resolves_latest_session(tmp_path):
+    # date=None -> resolve the target session via grouped.latest_session (used by
+    # the unattended daily job so it needn't hardcode a date).
+    by_date = {
+        "2026-07-02": [{"T": "FAD", "o": 10, "h": 10, "l": 10, "c": 10.0}],
+        "2026-07-03": [{"T": "FAD", "o": 10, "h": 10.6, "l": 9, "c": 9.0}],
+    }
+    grouped = _FakeGrouped(by_date, latest="2026-07-03")
+    minutes = _FakeMinutes(
+        {"FAD": _bars([(10.0, 10.0, 10.0), (10.6, 10.6, 10.6), (9.5, 9.4, 9.5)])}
+    )
+    s = _settings(tmp_path)
+    db = Database(s.db_path)
+    db.init_schema()
+    rc = main_mod.cmd_accumulate_shorts(
+        s, grouped, minutes, _FakeShortability({}), db, date=None, run_days=1, throttle_sec=0
+    )
+    assert rc == 0
+    assert db.count_short_setups(session_date="2026-07-03") == 1
+
+
+def test_accumulate_shorts_no_session_exits_clean(tmp_path):
+    grouped = _FakeGrouped({}, latest="")  # no data anywhere
+    s = _settings(tmp_path)
+    db = Database(s.db_path)
+    db.init_schema()
+    rc = main_mod.cmd_accumulate_shorts(
+        s, grouped, _FakeMinutes({}), _FakeShortability({}), db, date=None, throttle_sec=0
+    )
+    assert rc == 0
+    assert db.count_short_setups() == 0
 
 
 def test_accumulate_shorts_is_idempotent(tmp_path):

@@ -188,3 +188,30 @@ def test_grouped_source_requires_key():
 
     with pytest.raises(RuntimeError):
         PolygonGroupedSource(api_key="", bounds=BOUNDS)
+
+
+def test_latest_session_steps_back_to_available_data(monkeypatch):
+    from datetime import date
+
+    src = PolygonGroupedSource(api_key="k", bounds=BOUNDS)
+    # data exists only for 2026-07-02; 07-06 (Mon), 07-03 (Fri) return nothing
+    monkeypatch.setattr(src, "_fetch_grouped", lambda d: [{"T": "X"}] if d == "2026-07-02" else [])
+    # from a Monday, lag 0 -> steps Mon,Fri,Thu... until data at 2026-07-02 (Thu)
+    assert src.latest_session(lag_days=0, _today=date(2026, 7, 6)) == "2026-07-02"
+
+
+def test_latest_session_honors_lag_days(monkeypatch):
+    from datetime import date
+
+    src = PolygonGroupedSource(api_key="k", bounds=BOUNDS)
+    monkeypatch.setattr(src, "_fetch_grouped", lambda d: [{"T": "X"}])  # every day has data
+    # lag 2 from Fri 2026-07-03 -> start at Wed 2026-07-01 (latest with data)
+    assert src.latest_session(lag_days=2, _today=date(2026, 7, 3)) == "2026-07-01"
+
+
+def test_latest_session_empty_when_no_data(monkeypatch):
+    from datetime import date
+
+    src = PolygonGroupedSource(api_key="k", bounds=BOUNDS)
+    monkeypatch.setattr(src, "_fetch_grouped", lambda d: [])
+    assert src.latest_session(_today=date(2026, 7, 6)) == ""
