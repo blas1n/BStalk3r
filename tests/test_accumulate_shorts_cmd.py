@@ -204,6 +204,43 @@ def test_accumulate_shorts_no_session_exits_clean(tmp_path):
     assert db.count_short_setups() == 0
 
 
+def test_sample_budget_split_fairly_between_strategies(tmp_path):
+    # Both strategies abundant (3 each) but a tight budget (sample=4): each should
+    # get a fair share (2/2), total == budget — neither starves the other, and
+    # exhaustion volume can't blow past the cap.
+    e_syms = ["E0", "E1", "E2"]
+    f_syms = ["F0", "F1", "F2"]
+    start = [{"T": s, "o": 10, "h": 10, "l": 10, "c": 10.0} for s in e_syms]
+    mid = [{"T": s, "o": 15, "h": 15, "l": 15, "c": 15.0} for s in e_syms]  # +50% run end
+    mid += [{"T": s, "o": 10, "h": 10, "l": 10, "c": 10.0} for s in f_syms]  # crosser prev close
+    today = [{"T": s, "o": 15, "h": 15.2, "l": 12, "c": 12.5} for s in e_syms]
+    today += [{"T": s, "o": 10, "h": 10.6, "l": 9, "c": 9.0} for s in f_syms]
+    by_date = {"2026-07-01": start, "2026-07-02": mid, "2026-07-03": today}
+    grouped = _FakeGrouped(by_date)
+    fade_bar = _bars([(10.0, 10.0, 10.0), (10.6, 10.6, 10.6), (9.5, 9.4, 9.5)])
+    exh_bar = _bars([(15.2, 15.2, 15.2), (14.6, 14.6, 14.6), (13.0, 12.9, 13.0)])
+    minutes = _FakeMinutes({**{s: fade_bar for s in f_syms}, **{s: exh_bar for s in e_syms}})
+    s = _settings(tmp_path)
+    db = Database(s.db_path)
+    db.init_schema()
+    main_mod.cmd_accumulate_shorts(
+        s,
+        grouped,
+        minutes,
+        _FakeShortability({}),
+        db,
+        date="2026-07-03",
+        run_days=1,
+        run_gain=40.0,
+        sample=4,
+        throttle_sec=0,
+    )
+    rows = db.get_short_setups(session_date="2026-07-03")
+    n_fade = sum(1 for r in rows if r["strategy"] == "fade")
+    n_exh = sum(1 for r in rows if r["strategy"] == "exhaustion")
+    assert n_fade == 2 and n_exh == 2  # fair split, total == sample budget
+
+
 def test_accumulate_shorts_is_idempotent(tmp_path):
     by_date = {
         "2026-07-02": [{"T": "FAD", "o": 10, "h": 10, "l": 10, "c": 10.0}],

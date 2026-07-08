@@ -980,6 +980,29 @@ def cmd_exhaustion_intraday(
     return 0
 
 
+def _split_budget(n_a: int, n_b: int, total: int) -> tuple[int, int]:
+    """Split a fetch budget of `total` fairly between two pools of sizes n_a/n_b.
+
+    Each pool gets up to half; leftover from a pool that can't fill its half is
+    handed to the other. Total taken == min(total, n_a + n_b).
+    """
+    half = total // 2
+    a = min(n_a, half)
+    b = min(n_b, total - a)
+    a = min(n_a, total - b)  # reclaim if b under-filled
+    return a, b
+
+
+def _stride_take(items: list[Any], k: int) -> list[Any]:
+    """At most `k` items, stride-sampled across `items` (not just the first k)."""
+    if k <= 0:
+        return []
+    if len(items) <= k:
+        return items
+    stride = max(1, len(items) // k)
+    return items[::stride][:k]
+
+
 def cmd_accumulate_shorts(
     settings: Settings,
     grouped: PolygonGroupedSource,
@@ -1069,15 +1092,12 @@ def cmd_accumulate_shorts(
     ]
     exh = exhaustion_setups(run_ends, exh_trigger, exh_mode)
 
-    # Exhaustion setups are rare (a few/day) — keep them all so the thousands of
-    # daily fade crossers can't crowd them out. Fade fills the remaining budget,
-    # stride-sampled across the universe (not just the first N).
-    fade = setups
-    fade_budget = max(0, sample - len(exh))
-    if len(fade) > fade_budget:
-        stride = max(1, len(fade) // fade_budget) if fade_budget else len(fade) + 1
-        fade = fade[::stride][:fade_budget]
-    setups = fade + exh
+    # Split the minute-fetch budget fairly between the two strategies so neither
+    # (fade's thousands of crossers, or a high-parabolic day's many run-ends) can
+    # crowd out the other or blow past `sample`. Each side is stride-sampled
+    # across its universe to its share.
+    n_fade, n_exh = _split_budget(len(setups), len(exh), sample)
+    setups = _stride_take(setups, n_fade) + _stride_take(exh, n_exh)
 
     ep = settings.build_exit_params()
     recorded = 0
