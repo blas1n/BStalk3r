@@ -15,7 +15,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from src.short_accumulation import ShortSetup, ShortSetupRecord, build_short_record
+from src.exhaustion_intraday import RunEnd
+from src.short_accumulation import (
+    ShortSetup,
+    ShortSetupRecord,
+    build_short_record,
+    exhaustion_setups,
+    fade_setups,
+)
 from src.strategy import ExitParams
 
 _EXITS = ExitParams(
@@ -120,3 +127,40 @@ def test_shortable_status_recorded_even_when_true():
     bars = _bars([15.0, 16.05, 14.0, 13.0])
     rec = build_short_record(_setup(), bars, _EXITS, shortable=True, easy_to_borrow=True)
     assert rec.shortable is True and rec.easy_to_borrow is True
+
+
+# ---- strategy setup mappers (detectors -> unified ShortSetup) ----
+
+
+def test_fade_setups_maps_crossers_to_breakout_shorts():
+    crossers = [
+        {"symbol": "AAA", "prev_close": 10.0, "is_fizzle": True},
+        {"symbol": "BBB", "prev_close": 4.0, "is_fizzle": False},
+    ]
+    setups = fade_setups(crossers, session_date="2026-07-06", trigger_pct=5.0)
+    assert [s.symbol for s in setups] == ["AAA", "BBB"]
+    a = setups[0]
+    assert a.strategy == "fade" and a.entry_mode == "breakout"
+    assert a.ref_close == 10.0 and a.trigger_pct == 5.0
+    assert a.session_date == "2026-07-06"
+    assert a.is_fizzle is True and setups[1].is_fizzle is False
+    assert a.run_gain_pct is None
+
+
+def test_exhaustion_setups_maps_run_ends_to_breakdown_shorts():
+    ends = [
+        RunEnd(
+            symbol="RUNR",
+            run_end_date="2026-07-03",
+            short_day_date="2026-07-06",
+            run_gain_pct=120.0,
+            prev_close=15.0,
+        )
+    ]
+    setups = exhaustion_setups(ends, trigger_pct=2.0, entry_mode="breakdown")
+    assert len(setups) == 1
+    s = setups[0]
+    assert s.strategy == "exhaustion" and s.entry_mode == "breakdown"
+    assert s.symbol == "RUNR" and s.session_date == "2026-07-06"  # the short day
+    assert s.ref_close == 15.0 and s.trigger_pct == 2.0
+    assert s.run_gain_pct == 120.0 and s.is_fizzle is None

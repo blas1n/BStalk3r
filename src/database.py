@@ -118,6 +118,28 @@ CREATE TABLE IF NOT EXISTS daily_stats (
     max_drawdown REAL,
     notes TEXT
 );
+
+CREATE TABLE IF NOT EXISTS short_setups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    accumulated_at TEXT NOT NULL,
+    session_date TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    entry_mode TEXT NOT NULL,
+    triggered INTEGER NOT NULL,
+    entry_price REAL,
+    net_return_pct REAL,
+    exit_reason TEXT,
+    held_min REAL,
+    max_adverse_pct REAL,
+    shortable INTEGER NOT NULL,
+    easy_to_borrow INTEGER NOT NULL,
+    run_gain_pct REAL,
+    is_fizzle INTEGER,
+    features_json TEXT,
+    run_id INTEGER,
+    UNIQUE(session_date, symbol, strategy, entry_mode)
+);
 """
 
 
@@ -569,4 +591,77 @@ class Database:
         rows = self.conn.execute(
             "SELECT * FROM screened WHERE session_date=? ORDER BY day_change_pct DESC", (date,)
         ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- short-accumulation (simulated forward dataset) ----
+    def record_short_setup(self, record: Any, run_id: int | None = None) -> int:
+        """Upsert one simulated short-setup record (idempotent per
+        session_date+symbol+strategy+entry_mode; latest re-run wins)."""
+        cur = self.conn.execute(
+            """INSERT INTO short_setups
+               (accumulated_at, session_date, symbol, strategy, entry_mode, triggered,
+                entry_price, net_return_pct, exit_reason, held_min, max_adverse_pct,
+                shortable, easy_to_borrow, run_gain_pct, is_fizzle, features_json, run_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(session_date, symbol, strategy, entry_mode) DO UPDATE SET
+                 accumulated_at=excluded.accumulated_at,
+                 triggered=excluded.triggered,
+                 entry_price=excluded.entry_price,
+                 net_return_pct=excluded.net_return_pct,
+                 exit_reason=excluded.exit_reason,
+                 held_min=excluded.held_min,
+                 max_adverse_pct=excluded.max_adverse_pct,
+                 shortable=excluded.shortable,
+                 easy_to_borrow=excluded.easy_to_borrow,
+                 run_gain_pct=excluded.run_gain_pct,
+                 is_fizzle=excluded.is_fizzle,
+                 features_json=excluded.features_json,
+                 run_id=excluded.run_id""",
+            (
+                datetime.now(UTC).isoformat(),
+                record.session_date,
+                record.symbol,
+                record.strategy,
+                record.entry_mode,
+                1 if record.triggered else 0,
+                record.entry_price,
+                record.net_return_pct,
+                record.exit_reason,
+                record.held_min,
+                record.max_adverse_pct,
+                1 if record.shortable else 0,
+                1 if record.easy_to_borrow else 0,
+                record.run_gain_pct,
+                None if record.is_fizzle is None else (1 if record.is_fizzle else 0),
+                json.dumps(record.features or {}),
+                run_id,
+            ),
+        )
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT id FROM short_setups WHERE session_date=? AND symbol=? AND strategy=? "
+            "AND entry_mode=?",
+            (record.session_date, record.symbol, record.strategy, record.entry_mode),
+        ).fetchone()
+        return int(row["id"]) if row else int(cur.lastrowid)
+
+    def count_short_setups(self, session_date: str | None = None) -> int:
+        if session_date:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM short_setups WHERE session_date=?", (session_date,)
+            ).fetchone()
+        else:
+            row = self.conn.execute("SELECT COUNT(*) AS c FROM short_setups").fetchone()
+        return int(row["c"])
+
+    def get_short_setups(self, session_date: str | None = None) -> list[dict[str, Any]]:
+        if session_date:
+            rows = self.conn.execute(
+                "SELECT * FROM short_setups WHERE session_date=? ORDER BY strategy, symbol",
+                (session_date,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM short_setups ORDER BY session_date, strategy, symbol"
+            ).fetchall()
         return [dict(r) for r in rows]

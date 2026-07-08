@@ -18,6 +18,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.exhaustion_intraday import RunEnd
 from src.intraday import (
     entry_features,
     reconstruct_breakdown_entry,
@@ -59,6 +60,44 @@ class ShortSetupRecord:
     run_gain_pct: float | None
     is_fizzle: bool | None
     features: dict[str, float] = field(default_factory=dict)
+
+
+def fade_setups(
+    crossers: list[dict[str, Any]], session_date: str, trigger_pct: float
+) -> list[ShortSetup]:
+    """Map H-A crossers (`polygon_grouped_crossers` output) to fade shorts —
+    breakout entry (short the intraday up-cross), carrying the fizzle label."""
+    return [
+        ShortSetup(
+            symbol=c["symbol"],
+            session_date=session_date,
+            strategy="fade",
+            ref_close=float(c["prev_close"]),
+            trigger_pct=trigger_pct,
+            entry_mode="breakout",
+            is_fizzle=c.get("is_fizzle"),
+        )
+        for c in crossers
+    ]
+
+
+def exhaustion_setups(
+    run_ends: list[RunEnd], trigger_pct: float, entry_mode: str = "breakdown"
+) -> list[ShortSetup]:
+    """Map H-B run-ends (`qualifying_run_ends` output) to exhaustion shorts on the
+    session AFTER the run, carrying the run-gain context."""
+    return [
+        ShortSetup(
+            symbol=e.symbol,
+            session_date=e.short_day_date,
+            strategy="exhaustion",
+            ref_close=e.prev_close,
+            trigger_pct=trigger_pct,
+            entry_mode=entry_mode,
+            run_gain_pct=e.run_gain_pct,
+        )
+        for e in run_ends
+    ]
 
 
 def build_short_record(

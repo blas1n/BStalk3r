@@ -38,6 +38,7 @@ from src.outcomes import compute_outcomes
 from src.replay import round_trip_cost, simulate
 from src.risk import RiskParams, RiskState, check_entry_allowed, position_size
 from src.scanner import ScanFilters, scan_candidates
+from src.short_accumulation import build_short_record, exhaustion_setups, fade_setups
 from src.sources import (
     PolygonGainersSource,
     PolygonGroupedSource,
@@ -979,6 +980,131 @@ def cmd_exhaustion_intraday(
     return 0
 
 
+def cmd_accumulate_shorts(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    minute_bars: MinuteBarsProvider,
+    shortability: Any,
+    db: Database,
+    date: str,
+    run_days: int = 2,
+    run_gain: float = 30.0,
+    fade_trigger: float | None = None,
+    exh_trigger: float = 2.0,
+    exh_mode: str = "breakdown",
+    sample: int = 200,
+    cost_pct: float | None = None,
+    gross: bool = False,
+    throttle_sec: int | None = None,
+) -> int:
+    """Accumulate a forward, out-of-time dataset of *would-be* short outcomes.
+
+    Alpaca can't short our target runners, so instead of paper-trading we record,
+    per short setup (H-A fade crosser + H-B exhaustion run-end) for session
+    `date`: the entry-time features, the simulated intraday short outcome (live
+    short rules), and the live shortable/easy_to_borrow status. Idempotent per
+    (session, symbol, strategy, entry_mode) so re-runs refresh in place.
+    """
+    settings.validate_paper_safety()
+    trigger = settings.min_day_change_pct if fade_trigger is None else fade_trigger
+    base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+    run_id = _start_run(settings, db, mode="accumulate-shorts")
+
+    def cost_fn(price: float) -> float:
+        return round_trip_cost(
+            price, base_cost, settings.replay_cheap_price, settings.replay_cheap_extra_pct
+        )
+
+    # H-A fade crossers on the target session.
+    today_rows = grouped.fetch_grouped(date)
+    prev_by = {r["T"]: r for r in grouped.prev_session_rows(date) if r.get("T")}
+    crossers = (
+        polygon_grouped_crossers(
+            today_rows, prev_by, settings.min_price, settings.max_price, trigger
+        )
+        if today_rows
+        else []
+    )
+    setups = fade_setups(crossers, date, trigger)
+
+    # H-B exhaustion run-ends whose short day == the target session. Build the
+    # daily history back far enough to cover the run window (weekdays only).
+    daily: dict[str, list[dict[str, Any]]] = {}
+    target = datetime.fromisoformat(date).date()
+    day = target - timedelta(days=run_days + 5)
+    while day <= target:
+        if day.weekday() < 5:
+            rows = grouped.fetch_grouped(day.isoformat())
+            for r in rows or []:
+                sym = r.get("T")
+                if sym and r.get("c"):
+                    daily.setdefault(sym, []).append(
+                        {
+                            "date": day.isoformat(),
+                            "open": r.get("o"),
+                            "high": r.get("h"),
+                            "low": r.get("l"),
+                            "close": r["c"],
+                        }
+                    )
+            if throttle and day != target:
+                time.sleep(throttle)
+        day += timedelta(days=1)
+    run_ends = [
+        e
+        for e in qualifying_run_ends(
+            daily, run_days, run_gain, settings.min_price, settings.max_price
+        )
+        if e.short_day_date == date
+    ]
+    setups += exhaustion_setups(run_ends, exh_trigger, exh_mode)
+
+    if len(setups) > sample:
+        setups = setups[:sample]
+
+    ep = settings.build_exit_params()
+    recorded = 0
+    triggered_records: list[Any] = []
+    n_shortable = 0
+    for i, s in enumerate(setups):
+        status = shortability.get_shortability(s.symbol)
+        if status.get("shortable"):
+            n_shortable += 1
+        bars = minute_bars.fetch(s.symbol, s.session_date)
+        if bars:
+            rec = build_short_record(
+                s,
+                bars,
+                ep,
+                shortable=status.get("shortable", False),
+                easy_to_borrow=status.get("easy_to_borrow", False),
+                cost_fn=cost_fn,
+                min_price=settings.min_price,
+                max_price=settings.max_price,
+            )
+            if rec is not None:
+                db.record_short_setup(rec, run_id=run_id)
+                triggered_records.append(rec)
+                recorded += 1
+        if throttle and i < len(setups) - 1:
+            time.sleep(throttle)
+
+    n_fade = sum(1 for s in setups if s.strategy == "fade")
+    n_exh = sum(1 for s in setups if s.strategy == "exhaustion")
+    print(
+        f"accumulate-shorts {date}: {len(setups)} setups "
+        f"(fade {n_fade}, exhaustion {n_exh}) -> {recorded} triggered short setups recorded "
+        f"({'GROSS' if base_cost == 0 else f'net {base_cost:g}%+cheap'})"
+    )
+    print(f"  shortable at Alpaca: {n_shortable}/{len(setups)} (the executability wall)")
+    nets = [r.net_return_pct for r in triggered_records]
+    if nets:
+        print(f"  would-be short outcome: {_short_stats(nets)}")
+    print(f"  total short_setups in db: {db.count_short_setups()}")
+    return 0
+
+
 def cmd_run(
     settings: Settings,
     source: SnapshotSource,
@@ -1289,6 +1415,28 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_exh2.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
     p_exh2.add_argument("--gross", action="store_true", help="ignore costs")
+    p_acc = sub.add_parser(
+        "accumulate-shorts",
+        help="record would-be short outcomes + shortable status for a session (forward dataset)",
+    )
+    p_acc.add_argument("--date", required=True, help="target session YYYY-MM-DD (the short day)")
+    p_acc.add_argument("--run-days", type=int, default=2, help="exhaustion run length (sessions)")
+    p_acc.add_argument("--run-gain", type=float, default=30.0, help="min run gain %% over run-days")
+    p_acc.add_argument(
+        "--fade-trigger", type=float, help="fade up-cross %% (default min_day_change)"
+    )
+    p_acc.add_argument(
+        "--exh-trigger", type=float, default=2.0, help="exhaustion break %% vs run-end"
+    )
+    p_acc.add_argument(
+        "--exh-mode",
+        choices=["breakout", "breakdown"],
+        default="breakdown",
+        help="exhaustion entry: breakdown=short loss of prior close (default)",
+    )
+    p_acc.add_argument("--sample", type=int, default=200, help="max setups to minute-fetch")
+    p_acc.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
+    p_acc.add_argument("--gross", action="store_true", help="ignore costs")
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -1439,6 +1587,36 @@ def main(argv: list[str] | None = None) -> int:
             entry_trigger=args.entry,
             sample=args.sample,
             entry_mode=args.mode,
+            cost_pct=args.cost_pct,
+            gross=args.gross,
+        )
+
+    if args.command == "accumulate-shorts":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            minute_bars = PolygonMinuteBars(settings.polygon_api_key)
+            shortability = AlpacaTradingClient(
+                settings.alpaca_api_key, settings.alpaca_secret_key, paper=True
+            )
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_accumulate_shorts(
+            settings,
+            grouped,
+            minute_bars,
+            shortability,
+            db,
+            date=args.date,
+            run_days=args.run_days,
+            run_gain=args.run_gain,
+            fade_trigger=args.fade_trigger,
+            exh_trigger=args.exh_trigger,
+            exh_mode=args.exh_mode,
+            sample=args.sample,
             cost_pct=args.cost_pct,
             gross=args.gross,
         )
