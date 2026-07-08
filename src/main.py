@@ -20,6 +20,7 @@ from src.alpaca_client import AlpacaTradingClient
 from src.config import Settings, load_settings
 from src.database import Database
 from src.execution import ExecutionEngine
+from src.exhaustion import find_exhaustion_shorts
 from src.forward_bars import ForwardBarsProvider, PolygonDailyBars
 from src.intraday import (
     aggregate,
@@ -778,6 +779,85 @@ def cmd_features(
     return 0
 
 
+def _short_stats(rets: list[float]) -> str:
+    if not rets:
+        return "n=0"
+    avg = sum(rets) / len(rets)
+    med = sorted(rets)[len(rets) // 2]
+    win = sum(1 for x in rets if x > 0) / len(rets) * 100
+    return f"n={len(rets):>3d}  avg {avg:+5.1f}%  med {med:+5.1f}%  win {win:.0f}%"
+
+
+def cmd_exhaustion(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    start: str,
+    end: str,
+    run_days: int = 3,
+    run_gain: float = 50.0,
+    fwd_days: int = 1,
+    cost_pct: float | None = None,
+    gross: bool = False,
+    throttle_sec: int | None = None,
+) -> int:
+    """First-red-day / multi-day exhaustion SHORT concept test (H-B), daily bars
+    only (fast, no minute fetches). Parabolic run over `run_days` sessions then a
+    red day -> short; report intraday (open->close) and swing (+fwd_days) returns.
+    """
+    settings.validate_paper_safety()
+    base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+
+    daily: dict[str, list[dict[str, Any]]] = {}
+    day = datetime.fromisoformat(start).date()
+    end_d = datetime.fromisoformat(end).date()
+    n_sessions = 0
+    while day <= end_d:
+        if day.weekday() < 5:
+            rows = grouped.fetch_grouped(day.isoformat())
+            if rows:
+                n_sessions += 1
+                for r in rows:
+                    sym = r.get("T")
+                    if sym and r.get("c"):
+                        daily.setdefault(sym, []).append(
+                            {
+                                "date": day.isoformat(),
+                                "open": r.get("o"),
+                                "high": r.get("h"),
+                                "low": r.get("l"),
+                                "close": r["c"],
+                            }
+                        )
+                if throttle:
+                    time.sleep(throttle)
+        day += timedelta(days=1)
+
+    setups = find_exhaustion_shorts(
+        daily, run_days, run_gain, settings.min_price, settings.max_price, fwd_days, base_cost
+    )
+    print(
+        f"Exhaustion short {start}..{end} ({n_sessions} sessions): run ≥{run_gain:g}% over "
+        f"{run_days}d then first red day. {len(setups)} setups "
+        f"({'GROSS' if base_cost == 0 else f'net {base_cost:g}%+cheap'})"
+    )
+    if not setups:
+        print("  (no setups — thin data / raise date range or lower thresholds)")
+        return 0
+    intraday = [s.intraday_short_ret for s in setups]
+    swing = [s.swing_short_ret for s in setups if s.swing_short_ret is not None]
+    print(f"  intraday short (open->close of red day):  {_short_stats(intraday)}")
+    print(f"  swing short (red close -> +{fwd_days}d close): {_short_stats(swing)}")
+    print("  top setups by run gain:")
+    for s in sorted(setups, key=lambda x: -x.run_gain_pct)[:8]:
+        sw = f"{s.swing_short_ret:+.1f}%" if s.swing_short_ret is not None else "—"
+        print(
+            f"    {s.symbol:6s} run+{s.run_gain_pct:5.0f}% red {s.red_day_date}  "
+            f"intraday {s.intraday_short_ret:+5.1f}%  swing {sw}"
+        )
+    return 0
+
+
 def cmd_run(
     settings: Settings,
     source: SnapshotSource,
@@ -1056,6 +1136,16 @@ def main(argv: list[str] | None = None) -> int:
     p_feat.add_argument("--entry", type=float, help="cross trigger %% (default MIN_DAY_CHANGE_PCT)")
     p_feat.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
     p_feat.add_argument("--gross", action="store_true", help="ignore costs")
+    p_exh = sub.add_parser(
+        "exhaustion", help="first-red-day / multi-day exhaustion SHORT concept test (H-B)"
+    )
+    p_exh.add_argument("--start", required=True, help="range start YYYY-MM-DD")
+    p_exh.add_argument("--end", required=True, help="range end YYYY-MM-DD")
+    p_exh.add_argument("--run-days", type=int, default=3, help="parabolic run length (sessions)")
+    p_exh.add_argument("--run-gain", type=float, default=50.0, help="min run gain %% over run-days")
+    p_exh.add_argument("--fwd-days", type=int, default=1, help="swing horizon (sessions)")
+    p_exh.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
+    p_exh.add_argument("--gross", action="store_true", help="ignore costs")
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -1160,6 +1250,27 @@ def main(argv: list[str] | None = None) -> int:
             date=args.date,
             sample=args.sample,
             entry_trigger=args.entry,
+            cost_pct=args.cost_pct,
+            gross=args.gross,
+        )
+
+    if args.command == "exhaustion":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_exhaustion(
+            settings,
+            grouped,
+            start=args.start,
+            end=args.end,
+            run_days=args.run_days,
+            run_gain=args.run_gain,
+            fwd_days=args.fwd_days,
             cost_pct=args.cost_pct,
             gross=args.gross,
         )
