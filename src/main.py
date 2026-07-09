@@ -31,6 +31,7 @@ from src.intraday import (
     simulate_short_trade,
     simulate_trade,
 )
+from src.long_search import TradeInput, evaluate_combo, make_grid, search
 from src.market_data import AlpacaMarketData, MarketDataProvider
 from src.minute_bars import MinuteBarsProvider, PolygonMinuteBars
 from src.minute_cache import CachedMinuteBars
@@ -1176,6 +1177,147 @@ def cmd_short_report(settings: Settings, db: Database) -> int:
     return 0
 
 
+def _chrono_split(dates: list[str], train_frac: float, test_frac: float) -> dict[str, set[str]]:
+    """Chronological train/test/holdout split of sorted session dates."""
+    ordered = sorted(set(dates))
+    n = len(ordered)
+    n_tr = int(n * train_frac)
+    n_te = int(n * test_frac)
+    return {
+        "train": set(ordered[:n_tr]),
+        "test": set(ordered[n_tr : n_tr + n_te]),
+        "holdout": set(ordered[n_tr + n_te :]),
+    }
+
+
+def cmd_long_search(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    minute_bars: MinuteBarsProvider,
+    start: str,
+    end: str,
+    sample_per_day: int = 40,
+    train_frac: float = 0.6,
+    test_frac: float = 0.2,
+    shapes: list[str] | None = None,
+    entries: list[float] | None = None,
+    take_profits: list[float] | None = None,
+    max_holds: list[float] | None = None,
+    trailings: list[float] | None = None,
+    stops: list[float] | None = None,
+    min_n: int = 20,
+    top_k: int = 8,
+    cost_pct: float | None = None,
+    gross: bool = False,
+    throttle_sec: int | None = None,
+) -> int:
+    """Search long entry shapes × exit params over the honest crosser universe
+    with a chronological train/test/holdout split. Optimises on train, shows the
+    out-of-sample test degradation for the top combos, and evaluates only the
+    single best on holdout — so an overfit train winner is exposed, not shipped.
+    Minute bars are cached, so re-runs over the same window are instant."""
+    settings.validate_paper_safety()
+    base_cost = 0.0 if gross else (settings.replay_cost_pct if cost_pct is None else cost_pct)
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+
+    def cost_fn(price: float) -> float:
+        return round_trip_cost(
+            price, base_cost, settings.replay_cheap_price, settings.replay_cheap_extra_pct
+        )
+
+    # Build the crosser dataset over the window (cached minute fetches).
+    by_date: dict[str, list[TradeInput]] = {}
+    day = datetime.fromisoformat(start).date()
+    end_d = datetime.fromisoformat(end).date()
+    trigger = min(entries or [settings.min_day_change_pct])
+    while day <= end_d:
+        if day.weekday() < 5:
+            iso = day.isoformat()
+            today = grouped.fetch_grouped(iso)
+            if today:
+                prev_by = {r["T"]: r for r in grouped.prev_session_rows(iso) if r.get("T")}
+                crossers = polygon_grouped_crossers(
+                    today, prev_by, settings.min_price, settings.max_price, trigger
+                )
+                stride = max(1, len(crossers) // sample_per_day) if crossers else 1
+                picks = crossers[::stride][:sample_per_day]
+                for cr in picks:
+                    bars = minute_bars.fetch(cr["symbol"], iso)
+                    if bars:
+                        by_date.setdefault(iso, []).append(
+                            TradeInput(cr["symbol"], iso, cr["prev_close"], bars)
+                        )
+                    if throttle:
+                        time.sleep(throttle)
+        day += timedelta(days=1)
+
+    if not by_date:
+        print(f"long-search {start}..{end}: no crosser data in window.")
+        return 0
+
+    split_dates = _chrono_split(list(by_date), train_frac, test_frac)
+    splits = {name: [t for d in dates for t in by_date[d]] for name, dates in split_dates.items()}
+    grid = make_grid(
+        shapes=shapes or ["chase", "pullback"],
+        entry_min_change=entries or [settings.min_day_change_pct],
+        stop=stops or [settings.stop_loss_pct],
+        take_profit=take_profits or [0.10, 0.15],
+        trailing=trailings or [settings.trailing_stop_pct],
+        max_hold=max_holds or [60.0, 180.0],
+    )
+    results = search(splits, grid, settings.min_price, settings.max_price, cost_fn, min_n=min_n)
+
+    print(
+        f"long-search {start}..{end}: {sum(len(v) for v in by_date.values())} crosser-days over "
+        f"{len(by_date)} sessions | split train {len(split_dates['train'])} / test "
+        f"{len(split_dates['test'])} / holdout {len(split_dates['holdout'])} sessions | "
+        f"{len(grid)} combos, {len(results)} with ≥{min_n} train entries "
+        f"({'GROSS' if base_cost == 0 else f'net {base_cost:g}%+cheap'})"
+    )
+    if not results:
+        print("  (no combo cleared the min-sample gate — widen window or lower --min-n)")
+        return 0
+    hdr = (
+        f"  {'shape':9s} {'e%':>4s} {'tp':>4s} {'hold':>5s} {'trail':>5s} "
+        f"{'trainN':>6s} {'trainAvg':>8s} {'trainWin':>8s} {'testAvg':>7s} {'testWin':>7s}"
+    )
+    print(hdr)
+    for r in results[:top_k]:
+        c = r["combo"]
+        te = r["test"]
+        te_avg = f"{te['avg']:+.1f}" if te else "—"
+        te_win = f"{te['win_rate']:.0f}" if te else "—"
+        print(
+            f"  {c['shape']:9s} {c['entry_min_change']:>4.0f} {c['take_profit'] * 100:>4.0f} "
+            f"{c['max_hold']:>5.0f} {c['trailing'] * 100:>5.0f} "
+            f"{r['train']['n']:>6d} {r['train']['avg']:>+8.1f} {r['train']['win_rate']:>8.0f} "
+            f"{te_avg:>7s} {te_win:>7s}"
+        )
+
+    # Touch holdout ONCE, for the single best-by-train combo (the honest estimate).
+    best = results[0]
+    hold = evaluate_combo(
+        splits["holdout"], best["combo"], settings.min_price, settings.max_price, cost_fn
+    )
+    c = best["combo"]
+    print(
+        f"  --- best-by-train = {c['shape']} e{c['entry_min_change']:g} "
+        f"tp{c['take_profit'] * 100:g} hold{c['max_hold']:g} trail{c['trailing'] * 100:g}"
+    )
+    if hold:
+        print(
+            f"      HOLDOUT (touched once): n={hold['n']} avg {hold['avg']:+.1f}% "
+            f"med {hold['median']:+.1f}% win {hold['win_rate']:.0f}%"
+        )
+    else:
+        print("      HOLDOUT: no entries (can't confirm)")
+    print(
+        f"  note: {len(results)} combos scored on train — the best train avg is upward-biased; "
+        "trust the test/holdout columns, not train."
+    )
+    return 0
+
+
 def cmd_run(
     settings: Settings,
     source: SnapshotSource,
@@ -1517,6 +1659,25 @@ def main(argv: list[str] | None = None) -> int:
         "short-report",
         help="summarize accumulated short_setups by strategy × borrowability",
     )
+    p_ls = sub.add_parser(
+        "long-search",
+        help="search long entry shapes × params over crossers with train/test/holdout",
+    )
+    p_ls.add_argument("--start", required=True, help="window start YYYY-MM-DD")
+    p_ls.add_argument("--end", required=True, help="window end YYYY-MM-DD")
+    p_ls.add_argument("--sample", type=int, default=40, help="max crossers/day to fetch")
+    p_ls.add_argument("--train-frac", type=float, default=0.6, help="train fraction of sessions")
+    p_ls.add_argument("--test-frac", type=float, default=0.2, help="test fraction (rest=holdout)")
+    p_ls.add_argument("--shapes", default="chase,pullback", help="csv: chase,pullback")
+    p_ls.add_argument("--entries", help="csv entry %% triggers (default min_day_change)")
+    p_ls.add_argument("--take-profits", default="0.10,0.15", help="csv take-profit fractions")
+    p_ls.add_argument("--max-holds", default="60,180", help="csv max-hold minutes")
+    p_ls.add_argument("--trailings", help="csv trailing-stop fractions (default settings)")
+    p_ls.add_argument("--stops", help="csv stop-loss fractions (default settings)")
+    p_ls.add_argument("--min-n", type=int, default=20, help="min train entries to keep a combo")
+    p_ls.add_argument("--top-k", type=int, default=8, help="rows to print")
+    p_ls.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
+    p_ls.add_argument("--gross", action="store_true", help="ignore costs")
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -1704,6 +1865,37 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "short-report":
         return cmd_short_report(settings, db)
+
+    if args.command == "long-search":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            minute_bars = _minute_provider(settings)
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_long_search(
+            settings,
+            grouped,
+            minute_bars,
+            start=args.start,
+            end=args.end,
+            sample_per_day=args.sample,
+            train_frac=args.train_frac,
+            test_frac=args.test_frac,
+            shapes=[s.strip() for s in args.shapes.split(",") if s.strip()],
+            entries=_parse_floats(args.entries),
+            take_profits=_parse_floats(args.take_profits),
+            max_holds=_parse_floats(args.max_holds),
+            trailings=_parse_floats(args.trailings),
+            stops=_parse_floats(args.stops),
+            min_n=args.min_n,
+            top_k=args.top_k,
+            cost_pct=args.cost_pct,
+            gross=args.gross,
+        )
 
     if args.command == "replay":
         return cmd_replay(
