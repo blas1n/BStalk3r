@@ -18,6 +18,12 @@ from zoneinfo import ZoneInfo
 import structlog
 
 from src.alpaca_client import AlpacaTradingClient
+from src.calendar_strat import (
+    calendar_trades,
+    classify_tom,
+    equal_weight_returns,
+    summarize_trades,
+)
 from src.config import Settings, load_settings
 from src.database import Database
 from src.execution import ExecutionEngine
@@ -1607,6 +1613,116 @@ def cmd_mrsearch(
     return 0
 
 
+def cmd_calsearch(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    start: str,
+    end: str,
+    days_befores: list[int] | None = None,
+    days_afters: list[int] | None = None,
+    min_price: float = 5.0,
+    max_price: float = 1000.0,
+    min_dvol_m: float = 5.0,
+    train_frac: float = 0.6,
+    test_frac: float = 0.2,
+    cost_bps: float = 10.0,
+    top_k: int = 12,
+    throttle_sec: int | None = None,
+) -> int:
+    """Turn-of-Month calendar strategy search. Long an equal-weight liquid basket
+    only during the TOM window (last N + first M trading days), flat otherwise;
+    sweep the window widths with train/test/holdout. Structural (institutional
+    rebalancing) driver. Also prints the full-sample window vs non-window daily
+    mean (the concentration test)."""
+    settings.validate_paper_safety()
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+    cost_frac = cost_bps / 10000.0
+    min_dvol = min_dvol_m * 1_000_000
+
+    grouped_by_date: dict[str, list[dict[str, Any]]] = {}
+    day = datetime.fromisoformat(start).date()
+    end_d = datetime.fromisoformat(end).date()
+    while day <= end_d:
+        if day.weekday() < 5:
+            iso = day.isoformat()
+            rows = grouped.fetch_grouped(iso)
+            if rows:
+                grouped_by_date[iso] = rows
+            elif throttle:
+                time.sleep(throttle)
+        day += timedelta(days=1)
+
+    panel = build_panel(grouped_by_date)
+    if len(panel) < 40:
+        print(f"calsearch {start}..{end}: only {len(panel)} sessions — widen.")
+        return 0
+    ew = equal_weight_returns(panel, min_price, max_price, min_dvol)
+    ew_dates = [d for d, _ in ew]
+    split = _chrono_split(ew_dates, train_frac, test_frac)
+
+    grid = list(itertools.product(days_befores or [1, 2, 3], days_afters or [2, 3, 4]))
+    scored = []
+    for db, da in grid:
+        window = classify_tom(ew_dates, db, da)
+        trades = calendar_trades(ew, window, cost_frac)
+        buckets: dict[str, list] = {"train": [], "test": [], "holdout": []}
+        for t in trades:
+            for name, dates in split.items():
+                if t["entry_date"] in dates:
+                    buckets[name].append(t)
+                    break
+        tr = summarize_trades(buckets["train"])
+        if tr is None or tr["n"] < 3:
+            continue
+        te = summarize_trades(buckets["test"])
+        scored.append({"db": db, "da": da, "train": tr, "test": te, "hold": buckets["holdout"]})
+    scored.sort(key=lambda r: r["train"]["avg"], reverse=True)
+
+    # Full-sample concentration test: mean daily EW return, window vs non-window.
+    best_window = classify_tom(ew_dates, scored[0]["db"], scored[0]["da"]) if scored else set()
+    win_days = [r for d, r in ew if d in best_window]
+    non_days = [r for d, r in ew if d not in best_window]
+    wmean = sum(win_days) / len(win_days) if win_days else 0.0
+    nmean = sum(non_days) / len(non_days) if non_days else 0.0
+
+    print(
+        f"calsearch {start}..{end}: {len(ew)} return-days | split "
+        f"{len(split['train'])}/{len(split['test'])}/{len(split['holdout'])} | "
+        f"{len(grid)} window combos | ${min_price:g}-{max_price:g}, ≥${min_dvol_m:g}M/day, "
+        f"cost {cost_bps:g}bps/leg"
+    )
+    if not scored:
+        print("  (no window produced ≥3 train trades — widen the window)")
+        return 0
+    print(
+        f"  {'before':>6s} {'after':>5s} {'trN':>4s} {'trAvg%':>7s} {'trWin':>6s} "
+        f"{'teAvg%':>7s} {'teWin':>6s}"
+    )
+    for r in scored[:top_k]:
+        te = r["test"]
+        te_avg = f"{te['avg'] * 100:+.2f}" if te else "—"
+        te_win = f"{te['win']:.0f}" if te else "—"
+        print(
+            f"  {r['db']:>6d} {r['da']:>5d} {r['train']['n']:>4d} "
+            f"{r['train']['avg'] * 100:>+7.2f} {r['train']['win']:>6.0f} {te_avg:>7s} {te_win:>6s}"
+        )
+    best = scored[0]
+    hold_stats = summarize_trades(best["hold"])
+    print(f"  --- best-by-train = TOM last {best['db']} + first {best['da']} days")
+    if hold_stats:
+        print(
+            f"      HOLDOUT (touched once): n={hold_stats['n']} trades "
+            f"avg {hold_stats['avg'] * 100:+.2f}% win {hold_stats['win']:.0f}%"
+        )
+    else:
+        print("      HOLDOUT: too few trades to confirm")
+    print(
+        f"  concentration (full sample): window day mean {wmean * 100:+.3f}% "
+        f"vs non-window {nmean * 100:+.3f}% (daily EW return)"
+    )
+    return 0
+
+
 def cmd_run(
     settings: Settings,
     source: SnapshotSource,
@@ -2006,6 +2122,21 @@ def main(argv: list[str] | None = None) -> int:
     p_mr.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost, bps per leg")
     p_mr.add_argument("--min-n", type=int, default=30, help="min train trades to keep a combo")
     p_mr.add_argument("--top-k", type=int, default=12)
+    p_cal = sub.add_parser(
+        "calsearch",
+        help="turn-of-month calendar strategy search over a liquid basket",
+    )
+    p_cal.add_argument("--start", required=True, help="window start YYYY-MM-DD")
+    p_cal.add_argument("--end", required=True, help="window end YYYY-MM-DD")
+    p_cal.add_argument("--days-before", default="1,2,3", help="csv last-N-of-month widths")
+    p_cal.add_argument("--days-after", default="2,3,4", help="csv first-N-of-month widths")
+    p_cal.add_argument("--min-price", type=float, default=5.0)
+    p_cal.add_argument("--max-price", type=float, default=1000.0)
+    p_cal.add_argument("--min-dvol", type=float, default=5.0, help="min $ volume/day, millions")
+    p_cal.add_argument("--train-frac", type=float, default=0.6)
+    p_cal.add_argument("--test-frac", type=float, default=0.2)
+    p_cal.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost, bps per leg")
+    p_cal.add_argument("--top-k", type=int, default=12)
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -2297,6 +2428,33 @@ def main(argv: list[str] | None = None) -> int:
             test_frac=args.test_frac,
             cost_bps=args.cost_bps,
             min_n=args.min_n,
+            top_k=args.top_k,
+        )
+
+    if args.command == "calsearch":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_calsearch(
+            settings,
+            grouped,
+            start=args.start,
+            end=args.end,
+            days_befores=[int(x) for x in args.days_before.split(",") if x.strip()],
+            days_afters=[int(x) for x in args.days_after.split(",") if x.strip()],
+            min_price=args.min_price,
+            max_price=args.max_price,
+            min_dvol_m=args.min_dvol,
+            train_frac=args.train_frac,
+            test_frac=args.test_frac,
+            cost_bps=args.cost_bps,
             top_k=args.top_k,
         )
 
