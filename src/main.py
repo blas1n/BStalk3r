@@ -39,6 +39,7 @@ from src.replay import round_trip_cost, simulate
 from src.risk import RiskParams, RiskState, check_entry_allowed, position_size
 from src.scanner import ScanFilters, scan_candidates
 from src.short_accumulation import build_short_record, exhaustion_setups, fade_setups
+from src.short_report import summarize_short_setups
 from src.sources import (
     PolygonGainersSource,
     PolygonGroupedSource,
@@ -1141,6 +1142,30 @@ def cmd_accumulate_shorts(
     return 0
 
 
+def cmd_short_report(settings: Settings, db: Database) -> int:
+    """Summarize the accumulated short_setups: would-be outcome by strategy ×
+    borrowability. The (strategy, shortable=True) rows are the only executable
+    ones — the key question is whether that subset carries any edge."""
+    settings.validate_paper_safety()
+    summary = summarize_short_setups(db.get_short_setups())
+    if summary is None:
+        print("No short_setups accumulated yet (run accumulate-shorts).")
+        return 0
+    print(f"Short-setup dataset: {summary['n']} setups over {summary['sessions']} session(s)")
+    print(f"  {'strategy':11s} {'borrow':9s} {'n':>5s} {'avg%':>7s} {'med%':>7s} {'win%':>6s}")
+    for g in summary["groups"]:
+        borrow = "SHORTABLE" if g["shortable"] else "no-borrow"
+        print(
+            f"  {g['strategy']:11s} {borrow:9s} {g['n']:>5d} "
+            f"{g['avg']:>7.1f} {g['median']:>7.1f} {g['win']:>6.0f}"
+        )
+    print(
+        "  note: only SHORTABLE rows are executable retail — the rest are "
+        "borrow-blocked (the limits-to-arbitrage wall)."
+    )
+    return 0
+
+
 def cmd_run(
     settings: Settings,
     source: SnapshotSource,
@@ -1478,6 +1503,10 @@ def main(argv: list[str] | None = None) -> int:
     p_acc.add_argument("--sample", type=int, default=200, help="max setups to minute-fetch")
     p_acc.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
     p_acc.add_argument("--gross", action="store_true", help="ignore costs")
+    sub.add_parser(
+        "short-report",
+        help="summarize accumulated short_setups by strategy × borrowability",
+    )
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -1662,6 +1691,9 @@ def main(argv: list[str] | None = None) -> int:
             cost_pct=args.cost_pct,
             gross=args.gross,
         )
+
+    if args.command == "short-report":
+        return cmd_short_report(settings, db)
 
     if args.command == "replay":
         return cmd_replay(
