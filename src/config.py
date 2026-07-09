@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     # Persistent minute-bar cache so iterative backtests don't re-hit the
     # rate-limited API. Empty string disables caching (always fetch live).
     minute_cache_path: str = "data/minute_cache.db"
+    # Persistent grouped-daily cache (the other repeated backtest fetch). Empty
+    # disables. Only non-empty results are cached (too-recent 403s may land later).
+    grouped_cache_path: str = "data/grouped_cache.db"
 
     # universe source: "watchlist" | "polygon"
     universe_source: str = "watchlist"

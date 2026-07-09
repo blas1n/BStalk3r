@@ -1730,7 +1730,9 @@ def main(argv: list[str] | None = None) -> int:
             bounds = ScreenBounds(
                 settings.min_price, settings.max_price, settings.min_day_change_pct
             )
-            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
             minute_bars = _minute_provider(settings)
         except RuntimeError as exc:
             print(f"❌ {exc}", file=sys.stderr)
@@ -1751,7 +1753,9 @@ def main(argv: list[str] | None = None) -> int:
             bounds = ScreenBounds(
                 settings.min_price, settings.max_price, settings.min_day_change_pct
             )
-            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
             minute_bars = _minute_provider(settings)
         except RuntimeError as exc:
             print(f"❌ {exc}", file=sys.stderr)
@@ -1772,7 +1776,9 @@ def main(argv: list[str] | None = None) -> int:
             bounds = ScreenBounds(
                 settings.min_price, settings.max_price, settings.min_day_change_pct
             )
-            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
             minute_bars = _minute_provider(settings)
         except RuntimeError as exc:
             print(f"❌ {exc}", file=sys.stderr)
@@ -1793,7 +1799,9 @@ def main(argv: list[str] | None = None) -> int:
             bounds = ScreenBounds(
                 settings.min_price, settings.max_price, settings.min_day_change_pct
             )
-            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
         except RuntimeError as exc:
             print(f"❌ {exc}", file=sys.stderr)
             return 2
@@ -1814,7 +1822,9 @@ def main(argv: list[str] | None = None) -> int:
             bounds = ScreenBounds(
                 settings.min_price, settings.max_price, settings.min_day_change_pct
             )
-            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
             minute_bars = _minute_provider(settings)
         except RuntimeError as exc:
             print(f"❌ {exc}", file=sys.stderr)
@@ -1839,7 +1849,9 @@ def main(argv: list[str] | None = None) -> int:
             bounds = ScreenBounds(
                 settings.min_price, settings.max_price, settings.min_day_change_pct
             )
-            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
             minute_bars = _minute_provider(settings)
             shortability = AlpacaTradingClient(
                 settings.alpaca_api_key, settings.alpaca_secret_key, paper=True
@@ -1873,7 +1885,9 @@ def main(argv: list[str] | None = None) -> int:
             bounds = ScreenBounds(
                 settings.min_price, settings.max_price, settings.min_day_change_pct
             )
-            grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
             minute_bars = _minute_provider(settings)
         except RuntimeError as exc:
             print(f"❌ {exc}", file=sys.stderr)
