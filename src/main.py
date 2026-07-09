@@ -33,6 +33,7 @@ from src.intraday import (
 )
 from src.market_data import AlpacaMarketData, MarketDataProvider
 from src.minute_bars import MinuteBarsProvider, PolygonMinuteBars
+from src.minute_cache import CachedMinuteBars
 from src.models import PositionState
 from src.outcomes import compute_outcomes
 from src.replay import round_trip_cost, simulate
@@ -52,6 +53,15 @@ from src.strategy import EntryParams, ExitParams, evaluate_entry, evaluate_exit
 
 _ET = ZoneInfo("America/New_York")
 log = structlog.get_logger("bstalk3r")
+
+
+def _minute_provider(settings: Settings) -> MinuteBarsProvider:
+    """Live Polygon minute bars, wrapped in the persistent cache when enabled so
+    iterative backtests over a window don't re-pay the rate-limited fetch."""
+    live = PolygonMinuteBars(settings.polygon_api_key)
+    if settings.minute_cache_path:
+        return CachedMinuteBars(live, settings.minute_cache_path)
+    return live
 
 
 def _configure_logging() -> None:
@@ -1533,7 +1543,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "intraday":
         try:
-            minute_bars = PolygonMinuteBars(settings.polygon_api_key)
+            minute_bars = _minute_provider(settings)
         except RuntimeError as exc:
             print(f"❌ {exc}", file=sys.stderr)
             return 2
@@ -1558,7 +1568,7 @@ def main(argv: list[str] | None = None) -> int:
                 settings.min_price, settings.max_price, settings.min_day_change_pct
             )
             grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
-            minute_bars = PolygonMinuteBars(settings.polygon_api_key)
+            minute_bars = _minute_provider(settings)
         except RuntimeError as exc:
             print(f"❌ {exc}", file=sys.stderr)
             return 2
@@ -1579,7 +1589,7 @@ def main(argv: list[str] | None = None) -> int:
                 settings.min_price, settings.max_price, settings.min_day_change_pct
             )
             grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
-            minute_bars = PolygonMinuteBars(settings.polygon_api_key)
+            minute_bars = _minute_provider(settings)
         except RuntimeError as exc:
             print(f"❌ {exc}", file=sys.stderr)
             return 2
@@ -1600,7 +1610,7 @@ def main(argv: list[str] | None = None) -> int:
                 settings.min_price, settings.max_price, settings.min_day_change_pct
             )
             grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
-            minute_bars = PolygonMinuteBars(settings.polygon_api_key)
+            minute_bars = _minute_provider(settings)
         except RuntimeError as exc:
             print(f"❌ {exc}", file=sys.stderr)
             return 2
@@ -1642,7 +1652,7 @@ def main(argv: list[str] | None = None) -> int:
                 settings.min_price, settings.max_price, settings.min_day_change_pct
             )
             grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
-            minute_bars = PolygonMinuteBars(settings.polygon_api_key)
+            minute_bars = _minute_provider(settings)
         except RuntimeError as exc:
             print(f"❌ {exc}", file=sys.stderr)
             return 2
@@ -1667,7 +1677,7 @@ def main(argv: list[str] | None = None) -> int:
                 settings.min_price, settings.max_price, settings.min_day_change_pct
             )
             grouped = PolygonGroupedSource(settings.polygon_api_key, bounds)
-            minute_bars = PolygonMinuteBars(settings.polygon_api_key)
+            minute_bars = _minute_provider(settings)
             shortability = AlpacaTradingClient(
                 settings.alpaca_api_key, settings.alpaca_secret_key, paper=True
             )
