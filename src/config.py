@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     dry_run: bool = True
     db_path: str = "data/bstalk3r.db"
     report_dir: str = "reports"
+    # Persistent minute-bar cache so iterative backtests don't re-hit the
+    # rate-limited API. Empty string disables caching (always fetch live).
+    minute_cache_path: str = "data/minute_cache.db"
 
     # universe source: "watchlist" | "polygon"
     universe_source: str = "watchlist"
