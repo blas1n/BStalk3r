@@ -160,6 +160,50 @@ def reconstruct_breakdown_entry(
     return None
 
 
+def vwap_series(bars: list[dict[str, Any]]) -> list[float]:
+    """Running intraday VWAP: cumulative(typical_price × volume) / cumulative(vol),
+    typical = (high + low + close) / 3. Falls back to typical price when no volume
+    has accumulated yet (so early bars are still defined)."""
+    out: list[float] = []
+    cum_pv = 0.0
+    cum_v = 0.0
+    for b in bars:
+        typical = (b["high"] + b["low"] + b["close"]) / 3.0
+        vol = b.get("volume", 0) or 0
+        cum_pv += typical * vol
+        cum_v += vol
+        out.append(cum_pv / cum_v if cum_v else typical)
+    return out
+
+
+def reconstruct_pullback_entry(
+    bars: list[dict[str, Any]],
+    prev_close: float,
+    entry_min_change: float,
+    min_price: float,
+    max_price: float,
+) -> int | None:
+    """Index of the VWAP-reclaim entry after the runner activates, else None.
+
+    Activation = first bar crossing +`entry_min_change`% vs prior close (in band).
+    After that, wait for a *pullback* (a bar closing below running VWAP), then
+    enter on the first bar that *reclaims* — closes back above VWAP. Buys the dip
+    that resumes, the long-side short-term-reversal setup, rather than chasing.
+    """
+    activation = reconstruct_entry(bars, prev_close, entry_min_change, min_price, max_price)
+    if activation is None:
+        return None
+    vw = vwap_series(bars)
+    dipped = False
+    for i in range(activation + 1, len(bars)):
+        price = bars[i]["close"]
+        if price < vw[i]:
+            dipped = True
+        elif dipped and min_price <= price <= max_price:
+            return i  # first reclaim above VWAP after a pullback
+    return None
+
+
 def simulate_trade(
     bars: list[dict[str, Any]],
     prev_close: float,
@@ -168,10 +212,17 @@ def simulate_trade(
     max_price: float,
     exit_params: ExitParams,
     cost_fn: Callable[[float], float] | None = None,
+    entry_idx: int | None = None,
 ) -> IntradayTrade:
-    """Enter at the trigger, exit on the first live exit signal; net of cost."""
+    """Enter at the trigger, exit on the first live exit signal; net of cost.
+
+    Entry defaults to the first +`entry_min_change`% cross; pass `entry_idx` to
+    inject a caller-computed entry (e.g. a pullback reclaim) and reuse the exit
+    walk unchanged.
+    """
     cost = cost_fn or (lambda price: 0.0)
-    entry_idx = reconstruct_entry(bars, prev_close, entry_min_change, min_price, max_price)
+    if entry_idx is None:
+        entry_idx = reconstruct_entry(bars, prev_close, entry_min_change, min_price, max_price)
     if entry_idx is None:
         return IntradayTrade(entered=False)
 
