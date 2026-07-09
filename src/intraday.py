@@ -204,6 +204,51 @@ def reconstruct_pullback_entry(
     return None
 
 
+def reconstruct_orb_entry(
+    bars: list[dict[str, Any]],
+    prev_close: float,
+    entry_min_change: float,
+    min_price: float,
+    max_price: float,
+    orb_minutes: int = 15,
+) -> int | None:
+    """Opening-range-breakout: index of the first bar after the first
+    `orb_minutes` that closes above the opening-range high, is a qualified runner
+    (+`entry_min_change`% vs prior close), and in band. Else None. Selects
+    continuation, not the fizzle bulk."""
+    if len(bars) <= orb_minutes or prev_close <= 0:
+        return None
+    or_high = max(b["high"] for b in bars[:orb_minutes])
+    for i in range(orb_minutes, len(bars)):
+        price = bars[i]["close"]
+        change = (price - prev_close) / prev_close * 100
+        if price > or_high and change >= entry_min_change and min_price <= price <= max_price:
+            return i
+    return None
+
+
+def reconstruct_gap_and_go_entry(
+    bars: list[dict[str, Any]],
+    prev_close: float,
+    entry_min_change: float,
+    min_price: float,
+    max_price: float,
+) -> int | None:
+    """Gap-and-go: buy the open (bar 0) when it gaps up ≥ `entry_min_change`% vs
+    prior close and holds green (close ≥ open), in band. Else None."""
+    if not bars or prev_close <= 0:
+        return None
+    first = bars[0]
+    gap = (first["open"] - prev_close) / prev_close * 100
+    if (
+        gap >= entry_min_change
+        and first["close"] >= first["open"]
+        and min_price <= first["close"] <= max_price
+    ):
+        return 0
+    return None
+
+
 def simulate_trade(
     bars: list[dict[str, Any]],
     prev_close: float,
