@@ -34,6 +34,7 @@ from src.intraday import (
 )
 from src.long_search import TradeInput, evaluate_combo, make_grid, search
 from src.market_data import AlpacaMarketData, MarketDataProvider
+from src.mean_reversion import mean_reversion_trades, summarize_mr
 from src.minute_bars import MinuteBarsProvider, PolygonMinuteBars
 from src.minute_cache import CachedMinuteBars
 from src.models import PositionState
@@ -1454,6 +1455,158 @@ def cmd_xsearch(
     return 0
 
 
+def _panel_to_series(panel: dict[str, Any]) -> dict[str, dict[str, list]]:
+    """Pivot {date:{symbol:{close,dollar_vol}}} to per-symbol time series."""
+    series: dict[str, dict[str, list]] = {}
+    for d in sorted(panel):
+        for sym, rec in panel[d].items():
+            s = series.setdefault(sym, {"dates": [], "closes": [], "dvols": []})
+            s["dates"].append(d)
+            s["closes"].append(rec["close"])
+            s["dvols"].append(rec["dollar_vol"])
+    return series
+
+
+def cmd_mrsearch(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    start: str,
+    end: str,
+    rsi_periods: list[int] | None = None,
+    entry_rsis: list[float] | None = None,
+    exit_rsis: list[float] | None = None,
+    ma_periods: list[int] | None = None,
+    max_holds: list[int] | None = None,
+    min_price: float = 5.0,
+    max_price: float = 1000.0,
+    min_dvol_m: float = 5.0,
+    train_frac: float = 0.6,
+    test_frac: float = 0.2,
+    cost_bps: float = 10.0,
+    min_n: int = 30,
+    top_k: int = 12,
+    throttle_sec: int | None = None,
+) -> int:
+    """Short-term mean-reversion (RSI-2) search over a liquid universe. Per symbol,
+    dip-buy in an uptrend; sweep rsi/entry/exit/ma/hold, bucket trades by entry
+    date into train/test/holdout, rank by train sharpe, holdout the best once.
+    Behavioral-overreaction family — distinct from cross-sectional ranking."""
+    settings.validate_paper_safety()
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+    cost_frac = cost_bps / 10000.0
+    min_dvol = min_dvol_m * 1_000_000
+
+    grouped_by_date: dict[str, list[dict[str, Any]]] = {}
+    day = datetime.fromisoformat(start).date()
+    end_d = datetime.fromisoformat(end).date()
+    while day <= end_d:
+        if day.weekday() < 5:
+            iso = day.isoformat()
+            rows = grouped.fetch_grouped(iso)
+            if rows:
+                grouped_by_date[iso] = rows
+            elif throttle:
+                time.sleep(throttle)
+        day += timedelta(days=1)
+
+    panel = build_panel(grouped_by_date)
+    ordered = sorted(panel)
+    if len(ordered) < 40:
+        print(f"mrsearch {start}..{end}: only {len(ordered)} sessions — widen (MA needs warmup).")
+        return 0
+    split = _chrono_split(ordered, train_frac, test_frac)
+    series = _panel_to_series(panel)
+
+    grid = list(
+        itertools.product(
+            rsi_periods or [2],
+            entry_rsis or [5.0, 10.0],
+            exit_rsis or [50.0, 70.0],
+            ma_periods or [100, 200],
+            max_holds or [3, 5, 10],
+        )
+    )
+    scored = []
+    for rp, er, xr, ma, mh in grid:
+        buckets: dict[str, list] = {"train": [], "test": [], "holdout": []}
+        for s in series.values():
+            for t in mean_reversion_trades(
+                s["dates"],
+                s["closes"],
+                s["dvols"],
+                rsi_period=rp,
+                entry_rsi=er,
+                exit_rsi=xr,
+                ma_period=ma,
+                max_hold=mh,
+                min_price=min_price,
+                max_price=max_price,
+                min_dollar_vol=min_dvol,
+                cost_frac=cost_frac,
+            ):
+                for name, dates in split.items():
+                    if t["entry_date"] in dates:
+                        buckets[name].append(t)
+                        break
+        tr = summarize_mr(buckets["train"])
+        if tr is None or tr["n"] < min_n:
+            continue
+        te = summarize_mr(buckets["test"])
+        scored.append(
+            {
+                "rp": rp,
+                "er": er,
+                "xr": xr,
+                "ma": ma,
+                "mh": mh,
+                "train": tr,
+                "test": te,
+                "hold_trades": buckets["holdout"],
+            }
+        )
+    scored.sort(key=lambda r: r["train"]["sharpe"], reverse=True)
+
+    print(
+        f"mrsearch {start}..{end}: {len(ordered)} sessions, {len(series)} symbols | split "
+        f"{len(split['train'])}/{len(split['test'])}/{len(split['holdout'])} | "
+        f"{len(grid)} combos, {len(scored)} with ≥{min_n} train trades | "
+        f"${min_price:g}-{max_price:g}, ≥${min_dvol_m:g}M/day, cost {cost_bps:g}bps/leg"
+    )
+    if not scored:
+        print("  (no combo cleared the gate — widen window / lower --min-n)")
+        return 0
+    print(
+        f"  {'rsi':>3s} {'ent':>3s} {'ext':>3s} {'ma':>4s} {'hold':>4s} "
+        f"{'trN':>5s} {'trAvg%':>7s} {'trWin':>6s} {'trShrp':>7s} {'teAvg%':>7s} {'teWin':>6s}"
+    )
+    for r in scored[:top_k]:
+        te = r["test"]
+        te_avg = f"{te['avg'] * 100:+.2f}" if te else "—"
+        te_win = f"{te['win']:.0f}" if te else "—"
+        print(
+            f"  {r['rp']:>3d} {r['er']:>3.0f} {r['xr']:>3.0f} {r['ma']:>4d} {r['mh']:>4d} "
+            f"{r['train']['n']:>5d} {r['train']['avg'] * 100:>+7.2f} {r['train']['win']:>6.0f} "
+            f"{r['train']['sharpe']:>7.2f} {te_avg:>7s} {te_win:>6s}"
+        )
+
+    best = scored[0]
+    hold_stats = summarize_mr(best["hold_trades"])
+    print(
+        f"  --- best-by-train-sharpe = rsi{best['rp']} ent{best['er']:g} ext{best['xr']:g} "
+        f"ma{best['ma']} hold{best['mh']}"
+    )
+    if hold_stats:
+        print(
+            f"      HOLDOUT (touched once): n={hold_stats['n']} "
+            f"avg {hold_stats['avg'] * 100:+.2f}% win {hold_stats['win']:.0f}% "
+            f"sharpe {hold_stats['sharpe']:+.2f}"
+        )
+    else:
+        print("      HOLDOUT: too few trades to confirm")
+    print(f"  note: {len(scored)} combos scored — train sharpe upward-biased; trust test/holdout.")
+    return 0
+
+
 def cmd_run(
     settings: Settings,
     source: SnapshotSource,
@@ -1834,6 +1987,25 @@ def main(argv: list[str] | None = None) -> int:
     p_xs.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost, bps per leg")
     p_xs.add_argument("--min-n", type=int, default=20, help="min train rebalances to keep a combo")
     p_xs.add_argument("--top-k", type=int, default=12)
+    p_mr = sub.add_parser(
+        "mrsearch",
+        help="short-term mean-reversion (RSI-2) search over a liquid universe",
+    )
+    p_mr.add_argument("--start", required=True, help="window start YYYY-MM-DD")
+    p_mr.add_argument("--end", required=True, help="window end YYYY-MM-DD")
+    p_mr.add_argument("--rsi-periods", default="2", help="csv RSI lookback")
+    p_mr.add_argument("--entry-rsis", default="5,10", help="csv oversold entry thresholds")
+    p_mr.add_argument("--exit-rsis", default="50,70", help="csv bounce exit thresholds")
+    p_mr.add_argument("--ma-periods", default="100,200", help="csv regime SMA length")
+    p_mr.add_argument("--max-holds", default="3,5,10", help="csv max hold days")
+    p_mr.add_argument("--min-price", type=float, default=5.0)
+    p_mr.add_argument("--max-price", type=float, default=1000.0)
+    p_mr.add_argument("--min-dvol", type=float, default=5.0, help="min $ volume/day, millions")
+    p_mr.add_argument("--train-frac", type=float, default=0.6)
+    p_mr.add_argument("--test-frac", type=float, default=0.2)
+    p_mr.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost, bps per leg")
+    p_mr.add_argument("--min-n", type=int, default=30, help="min train trades to keep a combo")
+    p_mr.add_argument("--top-k", type=int, default=12)
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -2090,6 +2262,37 @@ def main(argv: list[str] | None = None) -> int:
             min_price=args.min_price,
             max_price=args.max_price,
             min_dollar_vol_m=args.min_dvol,
+            train_frac=args.train_frac,
+            test_frac=args.test_frac,
+            cost_bps=args.cost_bps,
+            min_n=args.min_n,
+            top_k=args.top_k,
+        )
+
+    if args.command == "mrsearch":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_mrsearch(
+            settings,
+            grouped,
+            start=args.start,
+            end=args.end,
+            rsi_periods=[int(x) for x in args.rsi_periods.split(",") if x.strip()],
+            entry_rsis=_parse_floats(args.entry_rsis),
+            exit_rsis=_parse_floats(args.exit_rsis),
+            ma_periods=[int(x) for x in args.ma_periods.split(",") if x.strip()],
+            max_holds=[int(x) for x in args.max_holds.split(",") if x.strip()],
+            min_price=args.min_price,
+            max_price=args.max_price,
+            min_dvol_m=args.min_dvol,
             train_frac=args.train_frac,
             test_frac=args.test_frac,
             cost_bps=args.cost_bps,
