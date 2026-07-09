@@ -7,6 +7,7 @@ sleep, repeat. No LLM / AI is invoked here by design (speed + determinism).
 from __future__ import annotations
 
 import argparse
+import itertools
 import sys
 import time
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ from src.sources import (
     polygon_grouped_crossers,
 )
 from src.strategy import EntryParams, ExitParams, evaluate_entry, evaluate_exit
+from src.xsectional import build_panel, cross_sectional_backtest, summarize_rebalances
 
 _ET = ZoneInfo("America/New_York")
 log = structlog.get_logger("bstalk3r")
@@ -1318,6 +1320,140 @@ def cmd_long_search(
     return 0
 
 
+def cmd_xsearch(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    start: str,
+    end: str,
+    strategies: list[str] | None = None,
+    formations: list[int] | None = None,
+    holds: list[int] | None = None,
+    quantiles: list[float] | None = None,
+    min_price: float = 5.0,
+    max_price: float = 1000.0,
+    min_dollar_vol_m: float = 5.0,
+    train_frac: float = 0.6,
+    test_frac: float = 0.2,
+    cost_bps: float = 10.0,
+    min_n: int = 20,
+    top_k: int = 12,
+    throttle_sec: int | None = None,
+) -> int:
+    """Cross-sectional reversal/momentum search over a liquid daily universe.
+
+    Ranks the universe by formation return, longs/shorts the quantile tails, holds
+    N days; sweeps strategy × formation × hold × quantile with a chronological
+    train/test/holdout split. Liquid (dollar-vol filtered) so the short leg is
+    executable. All daily/grouped data — cheap, cached."""
+    settings.validate_paper_safety()
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+    cost_frac = cost_bps / 10000.0
+    min_dollar_vol = min_dollar_vol_m * 1_000_000
+
+    grouped_by_date: dict[str, list[dict[str, Any]]] = {}
+    day = datetime.fromisoformat(start).date()
+    end_d = datetime.fromisoformat(end).date()
+    while day <= end_d:
+        if day.weekday() < 5:
+            iso = day.isoformat()
+            rows = grouped.fetch_grouped(iso)
+            if rows:
+                grouped_by_date[iso] = rows
+            elif throttle:
+                time.sleep(throttle)  # only sleep on a live miss (cached hits are free)
+        day += timedelta(days=1)
+
+    panel = build_panel(grouped_by_date)
+    ordered = sorted(panel)
+    if len(ordered) < 10:
+        print(f"xsearch {start}..{end}: only {len(ordered)} sessions — widen the window.")
+        return 0
+    split = _chrono_split(ordered, train_frac, test_frac)
+    sub = {name: {d: panel[d] for d in ordered if d in dates} for name, dates in split.items()}
+
+    grid = list(
+        itertools.product(
+            strategies or ["reversal", "momentum"],
+            formations or [3, 5, 10],
+            holds or [1, 3, 5],
+            quantiles or [0.1, 0.2],
+        )
+    )
+    scored = []
+    for strat, form, hold, q in grid:
+        tr = summarize_rebalances(
+            cross_sectional_backtest(
+                sub["train"], strat, form, hold, q, min_price, max_price, min_dollar_vol
+            ),
+            cost_frac,
+        )
+        if tr is None or tr["n"] < min_n:
+            continue
+        te = summarize_rebalances(
+            cross_sectional_backtest(
+                sub["test"], strat, form, hold, q, min_price, max_price, min_dollar_vol
+            ),
+            cost_frac,
+        )
+        scored.append({"strat": strat, "form": form, "hold": hold, "q": q, "train": tr, "test": te})
+    scored.sort(key=lambda r: r["train"]["sharpe"], reverse=True)
+
+    print(
+        f"xsearch {start}..{end}: {len(ordered)} sessions | split "
+        f"{len(split['train'])}/{len(split['test'])}/{len(split['holdout'])} | "
+        f"{len(grid)} combos, {len(scored)} with ≥{min_n} train rebalances | "
+        f"universe ${min_price:g}-{max_price:g}, ≥${min_dollar_vol_m:g}M/day, "
+        f"cost {cost_bps:g}bps/leg"
+    )
+    if not scored:
+        print("  (no combo cleared the gate — widen window / lower --min-n / relax liquidity)")
+        return 0
+    print(
+        f"  {'strat':9s} {'form':>4s} {'hold':>4s} {'q':>4s} "
+        f"{'trN':>4s} {'trAvg%':>7s} {'trWin':>6s} {'trShrp':>7s} {'teAvg%':>7s} {'teWin':>6s}"
+    )
+    for r in scored[:top_k]:
+        te = r["test"]
+        te_avg = f"{te['avg'] * 100:+.2f}" if te else "—"
+        te_win = f"{te['win']:.0f}" if te else "—"
+        print(
+            f"  {r['strat']:9s} {r['form']:>4d} {r['hold']:>4d} {r['q']:>4.2f} "
+            f"{r['train']['n']:>4d} {r['train']['avg'] * 100:>+7.2f} {r['train']['win']:>6.0f} "
+            f"{r['train']['sharpe']:>7.2f} {te_avg:>7s} {te_win:>6s}"
+        )
+
+    best = scored[0]
+    hold_stats = summarize_rebalances(
+        cross_sectional_backtest(
+            sub["holdout"],
+            best["strat"],
+            best["form"],
+            best["hold"],
+            best["q"],
+            min_price,
+            max_price,
+            min_dollar_vol,
+        ),
+        cost_frac,
+    )
+    print(
+        f"  --- best-by-train-sharpe = {best['strat']} form{best['form']} "
+        f"hold{best['hold']} q{best['q']}"
+    )
+    if hold_stats:
+        print(
+            f"      HOLDOUT (touched once): n={hold_stats['n']} "
+            f"avg {hold_stats['avg'] * 100:+.2f}% win {hold_stats['win']:.0f}% "
+            f"sharpe {hold_stats['sharpe']:+.2f}"
+        )
+    else:
+        print("      HOLDOUT: too few rebalances to confirm")
+    print(
+        f"  note: {len(scored)} combos scored — train sharpe is upward-biased; trust test/holdout."
+    )
+    return 0
+
+
 def cmd_run(
     settings: Settings,
     source: SnapshotSource,
@@ -1680,6 +1816,24 @@ def main(argv: list[str] | None = None) -> int:
     p_ls.add_argument("--top-k", type=int, default=8, help="rows to print")
     p_ls.add_argument("--cost-pct", type=float, help="round-trip cost %% override")
     p_ls.add_argument("--gross", action="store_true", help="ignore costs")
+    p_xs = sub.add_parser(
+        "xsearch",
+        help="cross-sectional reversal/momentum search over a liquid daily universe",
+    )
+    p_xs.add_argument("--start", required=True, help="window start YYYY-MM-DD")
+    p_xs.add_argument("--end", required=True, help="window end YYYY-MM-DD")
+    p_xs.add_argument("--strategies", default="reversal,momentum", help="csv: reversal,momentum")
+    p_xs.add_argument("--formations", default="3,5,10", help="csv formation lookback (sessions)")
+    p_xs.add_argument("--holds", default="1,3,5", help="csv hold length (sessions)")
+    p_xs.add_argument("--quantiles", default="0.1,0.2", help="csv tail fraction each side")
+    p_xs.add_argument("--min-price", type=float, default=5.0, help="universe min price")
+    p_xs.add_argument("--max-price", type=float, default=1000.0, help="universe max price")
+    p_xs.add_argument("--min-dvol", type=float, default=5.0, help="min $ volume/day, millions")
+    p_xs.add_argument("--train-frac", type=float, default=0.6)
+    p_xs.add_argument("--test-frac", type=float, default=0.2)
+    p_xs.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost, bps per leg")
+    p_xs.add_argument("--min-n", type=int, default=20, help="min train rebalances to keep a combo")
+    p_xs.add_argument("--top-k", type=int, default=12)
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -1911,6 +2065,36 @@ def main(argv: list[str] | None = None) -> int:
             top_k=args.top_k,
             cost_pct=args.cost_pct,
             gross=args.gross,
+        )
+
+    if args.command == "xsearch":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_xsearch(
+            settings,
+            grouped,
+            start=args.start,
+            end=args.end,
+            strategies=[s.strip() for s in args.strategies.split(",") if s.strip()],
+            formations=[int(x) for x in args.formations.split(",") if x.strip()],
+            holds=[int(x) for x in args.holds.split(",") if x.strip()],
+            quantiles=_parse_floats(args.quantiles),
+            min_price=args.min_price,
+            max_price=args.max_price,
+            min_dollar_vol_m=args.min_dvol,
+            train_frac=args.train_frac,
+            test_frac=args.test_frac,
+            cost_bps=args.cost_bps,
+            min_n=args.min_n,
+            top_k=args.top_k,
         )
 
     if args.command == "replay":
