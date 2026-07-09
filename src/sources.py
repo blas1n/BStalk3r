@@ -11,10 +11,13 @@ decides *which* symbols are looked at and fills MarketSnapshot fields.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import urllib.error
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -157,6 +160,7 @@ class PolygonGroupedSource:
         top_n: int = 50,
         timeout: int = 20,
         max_lookback_days: int = 10,
+        cache_path: str = "",
     ):
         if not api_key:
             raise RuntimeError("UNIVERSE_SOURCE=polygon requires POLYGON_API_KEY")
@@ -166,6 +170,16 @@ class PolygonGroupedSource:
         self._timeout = timeout
         self._max_lookback = max_lookback_days
         self._cache: dict[str, list[dict[str, Any]]] = {}
+        self._disk: sqlite3.Connection | None = None
+        if cache_path:
+            if cache_path != ":memory:":
+                Path(cache_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+            self._disk = sqlite3.connect(cache_path)
+            self._disk.execute(
+                "CREATE TABLE IF NOT EXISTS grouped_cache "
+                "(date TEXT PRIMARY KEY, rows_json TEXT NOT NULL)"
+            )
+            self._disk.commit()
 
     def fetch(self) -> list[MarketSnapshot]:
         today_date, today_rows = self._latest_session_with_data()
@@ -193,9 +207,25 @@ class PolygonGroupedSource:
         return []
 
     def _fetch_grouped(self, date_iso: str) -> list[dict[str, Any]]:
-        if date_iso not in self._cache:
-            self._cache[date_iso] = self._fetch_raw(date_iso).get("results") or []
-        return self._cache[date_iso]
+        if date_iso in self._cache:
+            return self._cache[date_iso]
+        if self._disk is not None:
+            row = self._disk.execute(
+                "SELECT rows_json FROM grouped_cache WHERE date=?", (date_iso,)
+            ).fetchone()
+            if row is not None:
+                rows = json.loads(row[0])
+                self._cache[date_iso] = rows
+                return rows
+        rows = self._fetch_raw(date_iso).get("results") or []
+        self._cache[date_iso] = rows
+        if self._disk is not None and rows:  # never persist empties (may land later)
+            self._disk.execute(
+                "INSERT OR REPLACE INTO grouped_cache (date, rows_json) VALUES (?,?)",
+                (date_iso, json.dumps(rows, separators=(",", ":"))),
+            )
+            self._disk.commit()
+        return rows
 
     def fetch_grouped(self, date_iso: str) -> list[dict[str, Any]]:
         """Public grouped rows for a specific date (cached). [] if no data."""
