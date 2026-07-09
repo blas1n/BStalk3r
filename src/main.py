@@ -1668,7 +1668,9 @@ def main(argv: list[str] | None = None) -> int:
     p_ls.add_argument("--sample", type=int, default=40, help="max crossers/day to fetch")
     p_ls.add_argument("--train-frac", type=float, default=0.6, help="train fraction of sessions")
     p_ls.add_argument("--test-frac", type=float, default=0.2, help="test fraction (rest=holdout)")
-    p_ls.add_argument("--shapes", default="chase,pullback", help="csv: chase,pullback")
+    p_ls.add_argument(
+        "--shapes", default="chase,pullback,orb,gap", help="csv: chase,pullback,orb,gap"
+    )
     p_ls.add_argument("--entries", help="csv entry %% triggers (default min_day_change)")
     p_ls.add_argument("--take-profits", default="0.10,0.15", help="csv take-profit fractions")
     p_ls.add_argument("--max-holds", default="60,180", help="csv max-hold minutes")

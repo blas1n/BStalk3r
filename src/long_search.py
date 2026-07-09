@@ -17,6 +17,8 @@ from typing import Any
 from src.intraday import (
     aggregate,
     reconstruct_entry,
+    reconstruct_gap_and_go_entry,
+    reconstruct_orb_entry,
     reconstruct_pullback_entry,
     simulate_trade,
 )
@@ -52,6 +54,10 @@ def _entry_idx(
 ) -> int | None:
     if shape == "pullback":
         return reconstruct_pullback_entry(bars, prev_close, trigger, lo, hi)
+    if shape == "orb":
+        return reconstruct_orb_entry(bars, prev_close, trigger, lo, hi)
+    if shape == "gap":
+        return reconstruct_gap_and_go_entry(bars, prev_close, trigger, lo, hi)
     return reconstruct_entry(bars, prev_close, trigger, lo, hi)  # "chase"
 
 
