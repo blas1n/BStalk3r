@@ -44,10 +44,12 @@ from src.mean_reversion import mean_reversion_trades, summarize_mr
 from src.minute_bars import MinuteBarsProvider, PolygonMinuteBars
 from src.minute_cache import CachedMinuteBars
 from src.models import PositionState
+from src.news_source import PolygonNews
 from src.outcomes import compute_outcomes
 from src.replay import round_trip_cost, simulate
 from src.risk import RiskParams, RiskState, check_entry_allowed, position_size
 from src.scanner import ScanFilters, scan_candidates
+from src.sentiment import aggregate_sentiment, sentiment_backtest
 from src.short_accumulation import build_short_record, exhaustion_setups, fade_setups
 from src.short_report import summarize_short_setups
 from src.sources import (
@@ -1723,6 +1725,128 @@ def cmd_calsearch(
     return 0
 
 
+def cmd_sentsearch(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    news: PolygonNews,
+    start: str,
+    end: str,
+    formations: list[int] | None = None,
+    holds: list[int] | None = None,
+    quantiles: list[float] | None = None,
+    min_price: float = 5.0,
+    max_price: float = 1000.0,
+    min_dvol_m: float = 20.0,
+    min_articles: int = 1,
+    train_frac: float = 0.6,
+    test_frac: float = 0.2,
+    cost_bps: float = 10.0,
+    min_n: int = 15,
+    top_k: int = 12,
+    throttle_sec: int | None = None,
+) -> int:
+    """News-sentiment cross-sectional search. Fetch Polygon news over the window
+    (scored + cached), long high-sentiment / short low-sentiment liquid names,
+    hold N days; sweep formation/hold/quantile with train/test/holdout. Non-price
+    alpha, executable (liquid = borrowable)."""
+    settings.validate_paper_safety()
+    cost_frac = cost_bps / 10000.0
+    min_dvol = min_dvol_m * 1_000_000
+
+    # Prices (grouped, cached) + news (scored, cached), day by day over the window.
+    grouped_by_date: dict[str, list[dict[str, Any]]] = {}
+    articles: list[dict[str, Any]] = []
+    day = datetime.fromisoformat(start).date()
+    end_d = datetime.fromisoformat(end).date()
+    while day <= end_d:
+        if day.weekday() < 5:
+            iso = day.isoformat()
+            rows = grouped.fetch_grouped(iso)
+            if rows:
+                grouped_by_date[iso] = rows
+            articles.extend(news.fetch_day(iso))
+        day += timedelta(days=1)
+
+    panel = build_panel(grouped_by_date)
+    ordered = sorted(panel)
+    if len(ordered) < 15:
+        print(f"sentsearch {start}..{end}: only {len(ordered)} sessions — widen.")
+        return 0
+    sentiment = aggregate_sentiment(articles)
+    split = _chrono_split(ordered, train_frac, test_frac)
+    sub = {name: {d: panel[d] for d in ordered if d in dates} for name, dates in split.items()}
+
+    grid = list(
+        itertools.product(formations or [1, 2, 3], holds or [1, 3, 5], quantiles or [0.1, 0.2])
+    )
+    scored = []
+    for form, hold, q in grid:
+        tr = summarize_rebalances(
+            sentiment_backtest(
+                sub["train"], sentiment, form, hold, q, min_price, max_price, min_dvol, min_articles
+            ),
+            cost_frac,
+        )
+        if tr is None or tr["n"] < min_n:
+            continue
+        te = summarize_rebalances(
+            sentiment_backtest(
+                sub["test"], sentiment, form, hold, q, min_price, max_price, min_dvol, min_articles
+            ),
+            cost_frac,
+        )
+        scored.append({"form": form, "hold": hold, "q": q, "train": tr, "test": te})
+    scored.sort(key=lambda r: r["train"]["sharpe"], reverse=True)
+
+    print(
+        f"sentsearch {start}..{end}: {len(ordered)} sessions, {len(sentiment)} ticker-days scored "
+        f"| split {len(split['train'])}/{len(split['test'])}/{len(split['holdout'])} | "
+        f"{len(grid)} combos, {len(scored)} kept | ≥${min_dvol_m:g}M/day, cost {cost_bps:g}bps/leg"
+    )
+    if not scored:
+        print("  (no combo cleared the gate — widen window / lower --min-n / --min-articles)")
+        return 0
+    print(
+        f"  {'form':>4s} {'hold':>4s} {'q':>4s} {'trN':>4s} {'trAvg%':>7s} {'trWin':>6s} "
+        f"{'trShrp':>7s} {'teAvg%':>7s} {'teWin':>6s}"
+    )
+    for r in scored[:top_k]:
+        te = r["test"]
+        te_avg = f"{te['avg'] * 100:+.2f}" if te else "—"
+        te_win = f"{te['win']:.0f}" if te else "—"
+        print(
+            f"  {r['form']:>4d} {r['hold']:>4d} {r['q']:>4.2f} {r['train']['n']:>4d} "
+            f"{r['train']['avg'] * 100:>+7.2f} {r['train']['win']:>6.0f} "
+            f"{r['train']['sharpe']:>7.2f} {te_avg:>7s} {te_win:>6s}"
+        )
+    best = scored[0]
+    hold_stats = summarize_rebalances(
+        sentiment_backtest(
+            sub["holdout"],
+            sentiment,
+            best["form"],
+            best["hold"],
+            best["q"],
+            min_price,
+            max_price,
+            min_dvol,
+            min_articles,
+        ),
+        cost_frac,
+    )
+    print(f"  --- best-by-train-sharpe = form{best['form']} hold{best['hold']} q{best['q']}")
+    if hold_stats:
+        print(
+            f"      HOLDOUT (touched once): n={hold_stats['n']} "
+            f"avg {hold_stats['avg'] * 100:+.2f}% win {hold_stats['win']:.0f}% "
+            f"sharpe {hold_stats['sharpe']:+.2f}"
+        )
+    else:
+        print("      HOLDOUT: too few rebalances to confirm")
+    print(f"  note: {len(scored)} combos scored — train sharpe upward-biased; trust test/holdout.")
+    return 0
+
+
 def cmd_run(
     settings: Settings,
     source: SnapshotSource,
@@ -2137,6 +2261,24 @@ def main(argv: list[str] | None = None) -> int:
     p_cal.add_argument("--test-frac", type=float, default=0.2)
     p_cal.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost, bps per leg")
     p_cal.add_argument("--top-k", type=int, default=12)
+    p_sent = sub.add_parser(
+        "sentsearch",
+        help="news-sentiment cross-sectional search (Polygon free news)",
+    )
+    p_sent.add_argument("--start", required=True, help="window start YYYY-MM-DD")
+    p_sent.add_argument("--end", required=True, help="window end YYYY-MM-DD")
+    p_sent.add_argument("--formations", default="1,2,3", help="csv sentiment lookback days")
+    p_sent.add_argument("--holds", default="1,3,5", help="csv hold length (sessions)")
+    p_sent.add_argument("--quantiles", default="0.1,0.2", help="csv tail fraction each side")
+    p_sent.add_argument("--min-price", type=float, default=5.0)
+    p_sent.add_argument("--max-price", type=float, default=1000.0)
+    p_sent.add_argument("--min-dvol", type=float, default=20.0, help="min $ volume/day, millions")
+    p_sent.add_argument("--min-articles", type=int, default=1, help="min articles to rank a name")
+    p_sent.add_argument("--train-frac", type=float, default=0.6)
+    p_sent.add_argument("--test-frac", type=float, default=0.2)
+    p_sent.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost, bps per leg")
+    p_sent.add_argument("--min-n", type=int, default=15, help="min train rebalances to keep")
+    p_sent.add_argument("--top-k", type=int, default=12)
 
     args = parser.parse_args(argv)
     settings = load_settings()
@@ -2455,6 +2597,38 @@ def main(argv: list[str] | None = None) -> int:
             train_frac=args.train_frac,
             test_frac=args.test_frac,
             cost_bps=args.cost_bps,
+            top_k=args.top_k,
+        )
+
+    if args.command == "sentsearch":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
+            news = PolygonNews(settings.polygon_api_key, cache_path=settings.news_cache_path)
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_sentsearch(
+            settings,
+            grouped,
+            news,
+            start=args.start,
+            end=args.end,
+            formations=[int(x) for x in args.formations.split(",") if x.strip()],
+            holds=[int(x) for x in args.holds.split(",") if x.strip()],
+            quantiles=_parse_floats(args.quantiles),
+            min_price=args.min_price,
+            max_price=args.max_price,
+            min_dvol_m=args.min_dvol,
+            min_articles=args.min_articles,
+            train_frac=args.train_frac,
+            test_frac=args.test_frac,
+            cost_bps=args.cost_bps,
+            min_n=args.min_n,
             top_k=args.top_k,
         )
 

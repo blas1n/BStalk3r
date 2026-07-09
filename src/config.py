@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     # Persistent grouped-daily cache (the other repeated backtest fetch). Empty
     # disables. Only non-empty results are cached (too-recent 403s may land later).
     grouped_cache_path: str = "data/grouped_cache.db"
+    # Persistent per-day news cache (scored Polygon headlines). Empty disables.
+    news_cache_path: str = "data/news_cache.db"
 
     # universe source: "watchlist" | "polygon"
     universe_source: str = "watchlist"
