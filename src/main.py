@@ -40,6 +40,7 @@ from src.intraday import (
 )
 from src.long_search import TradeInput, evaluate_combo, make_grid, search
 from src.market_data import AlpacaMarketData, MarketDataProvider
+from src.market_regime import calm_dates
 from src.mean_reversion import mean_reversion_trades, summarize_mr
 from src.minute_bars import MinuteBarsProvider, PolygonMinuteBars
 from src.minute_cache import CachedMinuteBars
@@ -1652,6 +1653,8 @@ def cmd_mrportfolio(
     max_positions: int = 20,
     cost_bps: float = 10.0,
     ranked: bool = False,
+    vix_max: float | None = None,
+    vol_window: int = 20,
     throttle_sec: int | None = None,
 ) -> int:
     """Portfolio-level validation of the RSI-2 mean-reversion edge: run the
@@ -1694,13 +1697,22 @@ def cmd_mrportfolio(
         min_dollar_vol=min_dvol_m * 1_000_000,
         cost_frac=0.0,
     )
+    # Vol-regime gate: only enter on calm dates (SPY realized vol <= vix_max).
+    allowed = None
+    regime_note = "no vol filter"
+    if vix_max is not None and "SPY" in series:
+        spy = series["SPY"]
+        allowed = calm_dates(spy["dates"], spy["closes"], vol_window, vix_max)
+        mr_kw["allowed_dates"] = allowed
+        regime_note = f"SPY {vol_window}d rvol ≤ {vix_max:g} ({len(allowed)}/{len(ordered)} calm)"
     all_trades = _mr_all_trades(series, mr_kw)
 
     print(
         f"mrportfolio {start}..{end}: {len(ordered)} sessions, {len(series)} symbols | "
         f"RSI{rsi_period} ent{entry_rsi:g} ext{exit_rsi:g} ma{ma_period} hold{max_hold} | "
         f"{len(all_trades)} raw signals | book {max_positions} slots "
-        f"({'RANKED by oversold' if ranked else 'first-come'}), cost {cost_bps:g}bps/leg"
+        f"({'RANKED by oversold' if ranked else 'first-come'}), cost {cost_bps:g}bps/leg "
+        f"| {regime_note}"
     )
     rank_key = "entry_rsi" if ranked else None
     full = simulate_portfolio(price, all_trades, max_positions, cost_frac, rank_key=rank_key)
@@ -2379,6 +2391,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="admit most-oversold signals first under capacity (vs first-come)",
     )
+    p_mp.add_argument(
+        "--vix-max",
+        type=float,
+        help="only enter when SPY realized vol (annualized) <= this (e.g. 0.20)",
+    )
+    p_mp.add_argument("--vol-window", type=int, default=20, help="realized-vol lookback (days)")
     p_cal = sub.add_parser(
         "calsearch",
         help="turn-of-month calendar strategy search over a liquid basket",
@@ -2733,6 +2751,8 @@ def main(argv: list[str] | None = None) -> int:
             max_positions=args.max_positions,
             cost_bps=args.cost_bps,
             ranked=args.ranked,
+            vix_max=args.vix_max,
+            vol_window=args.vol_window,
         )
 
     if args.command == "calsearch":

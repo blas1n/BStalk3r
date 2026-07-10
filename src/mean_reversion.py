@@ -57,12 +57,14 @@ def mean_reversion_trades(
     max_price: float = 1000.0,
     min_dollar_vol: float = 0.0,
     cost_frac: float = 0.0,
+    allowed_dates: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Walk one symbol's daily series; long the oversold dip in an uptrend, exit
     on the bounce or max-hold. Returns a list of trades (net of round-trip cost).
 
-    Entry at bar i: RSI ≤ `entry_rsi`, in band, liquid, and (ma_period=0 or
-    close > SMA). Exit at the first later bar with RSI ≥ `exit_rsi`, or after
+    Entry at bar i: RSI ≤ `entry_rsi`, in band, liquid, (ma_period=0 or close >
+    SMA), and — if `allowed_dates` is given — the entry date is in it (market
+    vol-regime gate). Exit at the first later bar with RSI ≥ `exit_rsi`, or after
     `max_hold` bars (fill at that bar's close)."""
     r = rsi(closes, rsi_period)
     m = sma(closes, ma_period) if ma_period > 0 else [None] * len(closes)
@@ -72,10 +74,12 @@ def mean_reversion_trades(
     while i < n:
         price = closes[i]
         regime_ok = ma_period <= 0 or (m[i] is not None and price > m[i])
+        calm_ok = allowed_dates is None or dates[i] in allowed_dates
         if (
             r[i] is not None
             and r[i] <= entry_rsi
             and regime_ok
+            and calm_ok
             and min_price <= price <= max_price
             and dollar_vols[i] >= min_dollar_vol
         ):
