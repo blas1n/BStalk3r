@@ -66,6 +66,29 @@ class _FakeTrading:
         raise AssertionError("should not place orders in DRY_RUN")
 
 
+class _AlpacaPos:
+    def __init__(self, symbol, qty, avg):
+        self.symbol, self.qty, self.avg_entry_price = symbol, qty, avg
+
+
+class _LiveTrading:
+    """Live paper broker: holds positions in Alpaca (source of truth), fills orders."""
+
+    def __init__(self, positions):
+        self._positions = positions
+        self.placed = []
+
+    def get_account(self):
+        return _FakeAccount()
+
+    def get_open_positions(self):
+        return self._positions
+
+    def submit_limit_order(self, symbol, qty, side, limit_price):
+        self.placed.append((symbol, side.value, qty))
+        return type("O", (), {"id": "x", "status": "accepted"})()
+
+
 def _settings(tmp_path, dry_run=True):
     return Settings(
         alpaca_api_key="k",
@@ -121,3 +144,35 @@ def test_mr_trade_paper_safety_and_no_session(tmp_path, capsys):
     rc = main_mod.cmd_mr_trade(s, _NoData(), _FakeMarket({}), _FakeTrading(), db, throttle_sec=0)
     assert rc == 0
     assert "no grouped session" in capsys.readouterr().out
+
+
+def test_mr_trade_live_reads_held_from_alpaca(tmp_path, capsys):
+    # LIVE mode (dry_run=False): held positions come from Alpaca, not our DB.
+    s = _settings(tmp_path, dry_run=False)
+    db = Database(s.db_path)
+    db.init_schema()
+    # Alpaca reports holding AAA (RSI-2 bounced -> should be SOLD)
+    trading = _LiveTrading([_AlpacaPos("AAA", 100, 20.0)])
+    market = _FakeMarket({"AAA": 30.0})  # big pop -> RSI-2 high -> exit
+    rc = main_mod.cmd_mr_trade(
+        s,
+        _FakeGrouped(),
+        market,
+        trading,
+        db,
+        rsi_period=2,
+        entry_rsi=1,
+        exit_rsi=70,
+        ma_period=3,
+        max_hold=10,
+        max_positions=5,
+        min_price=1.0,
+        max_price=1000.0,
+        min_dvol_m=0.0,
+        throttle_sec=0,
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "LIVE PAPER ORDERS" in out and "held 1" in out
+    # a real SELL order was routed for the Alpaca-held AAA
+    assert any(side == "sell" and sym == "AAA" for sym, side, _ in trading.placed)
