@@ -97,6 +97,7 @@ def mean_reversion_trades(
                     "exit_price": exit_price,
                     "ret": gross - 2 * cost_frac,
                     "held": exit_idx - i,
+                    "entry_rsi": r[i],  # signal strength (lower = more oversold)
                 }
             )
             i = exit_idx + 1  # no overlapping positions in one symbol

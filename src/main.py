@@ -1651,6 +1651,7 @@ def cmd_mrportfolio(
     min_dvol_m: float = 10.0,
     max_positions: int = 20,
     cost_bps: float = 10.0,
+    ranked: bool = False,
     throttle_sec: int | None = None,
 ) -> int:
     """Portfolio-level validation of the RSI-2 mean-reversion edge: run the
@@ -1698,9 +1699,11 @@ def cmd_mrportfolio(
     print(
         f"mrportfolio {start}..{end}: {len(ordered)} sessions, {len(series)} symbols | "
         f"RSI{rsi_period} ent{entry_rsi:g} ext{exit_rsi:g} ma{ma_period} hold{max_hold} | "
-        f"{len(all_trades)} raw signals | book {max_positions} slots, cost {cost_bps:g}bps/leg"
+        f"{len(all_trades)} raw signals | book {max_positions} slots "
+        f"({'RANKED by oversold' if ranked else 'first-come'}), cost {cost_bps:g}bps/leg"
     )
-    full = simulate_portfolio(price, all_trades, max_positions, cost_frac)
+    rank_key = "entry_rsi" if ranked else None
+    full = simulate_portfolio(price, all_trades, max_positions, cost_frac, rank_key=rank_key)
     dropped = len(all_trades) - full["stats"]["n_trades"]
     _print_portfolio_stats("FULL", full["stats"])
     per_session = len(all_trades) / max(1, len(ordered))
@@ -1713,7 +1716,7 @@ def cmd_mrportfolio(
     mid = ordered[len(ordered) // 2]
     for label, keep in [("2024-H", lambda e: e < mid), ("2025-26H", lambda e: e >= mid)]:
         sub = [t for t in all_trades if keep(t["entry_date"])]
-        st = simulate_portfolio(price, sub, max_positions, cost_frac)["stats"]
+        st = simulate_portfolio(price, sub, max_positions, cost_frac, rank_key=rank_key)["stats"]
         _print_portfolio_stats(label, st)
     print(
         "  note: capacity-capped equal-weight book; entry/exit cost per leg; "
@@ -2371,6 +2374,11 @@ def main(argv: list[str] | None = None) -> int:
         "--max-positions", type=int, default=20, help="book size (equal-weight slots)"
     )
     p_mp.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost, bps per leg")
+    p_mp.add_argument(
+        "--ranked",
+        action="store_true",
+        help="admit most-oversold signals first under capacity (vs first-come)",
+    )
     p_cal = sub.add_parser(
         "calsearch",
         help="turn-of-month calendar strategy search over a liquid basket",
@@ -2724,6 +2732,7 @@ def main(argv: list[str] | None = None) -> int:
             min_dvol_m=args.min_dvol,
             max_positions=args.max_positions,
             cost_bps=args.cost_bps,
+            ranked=args.ranked,
         )
 
     if args.command == "calsearch":

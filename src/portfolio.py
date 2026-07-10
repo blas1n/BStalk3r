@@ -21,15 +21,23 @@ def simulate_portfolio(
     max_positions: int,
     cost_frac: float,
     periods_per_year: int = 252,
+    rank_key: str | None = None,
 ) -> dict[str, Any]:
     """Daily equity simulation of `trades` under a `max_positions` equal-weight
     book. Each slot gets 1/max_positions of capital; excess same-day signals are
     dropped (capacity). Positions are marked daily off closes; entry/exit cost is
-    charged 1/max_positions per position. Returns {daily: [(date, ret)], stats}."""
+    charged 1/max_positions per position. Returns {daily: [(date, ret)], stats}.
+
+    `rank_key`: when set, same-day signals competing for scarce slots are admitted
+    by ascending trade[rank_key] (e.g. 'entry_rsi' → most-oversold first) instead
+    of first-come."""
     dates = sorted({d for s in price.values() for d in s})
     entries_by_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for t in trades:
         entries_by_date[t["entry_date"]].append(t)
+    if rank_key is not None:
+        for lst in entries_by_date.values():
+            lst.sort(key=lambda t: t.get(rank_key, 0.0))
 
     open_pos: list[dict[str, Any]] = []
     daily: list[tuple[str, float]] = []
