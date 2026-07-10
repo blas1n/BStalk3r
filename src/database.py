@@ -156,8 +156,20 @@ class Database:
         self.conn.row_factory = sqlite3.Row
 
     # ---- schema ----
+    # Columns added after the original schema; existing DBs need an ALTER since
+    # CREATE TABLE IF NOT EXISTS never adds columns to a table that already exists.
+    _MIGRATIONS = (
+        ("orders", "run_id", "INTEGER"),
+        ("signals", "run_id", "INTEGER"),
+        ("positions", "run_id", "INTEGER"),
+    )
+
     def init_schema(self) -> None:
         self.conn.executescript(_SCHEMA)
+        for table, col, coltype in self._MIGRATIONS:
+            existing = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if existing and col not in existing:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
         self.conn.commit()
 
     def close(self) -> None:
