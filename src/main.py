@@ -46,6 +46,7 @@ from src.minute_cache import CachedMinuteBars
 from src.models import PositionState
 from src.news_source import PolygonNews
 from src.outcomes import compute_outcomes
+from src.portfolio import simulate_portfolio
 from src.replay import round_trip_cost, simulate
 from src.risk import RiskParams, RiskState, check_entry_allowed, position_size
 from src.scanner import ScanFilters, scan_candidates
@@ -1615,6 +1616,112 @@ def cmd_mrsearch(
     return 0
 
 
+def _mr_all_trades(
+    series: dict[str, dict[str, list]], mr_kw: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Every RSI-2 trade across all symbols as {symbol, entry_date, exit_date}."""
+    out = []
+    for sym, s in series.items():
+        for t in mean_reversion_trades(s["dates"], s["closes"], s["dvols"], **mr_kw):
+            out.append({"symbol": sym, "entry_date": t["entry_date"], "exit_date": t["exit_date"]})
+    return out
+
+
+def _print_portfolio_stats(label: str, st: dict[str, Any]) -> None:
+    print(
+        f"  {label:10s} trades {st['n_trades']:>6d}  CAGR {st['cagr'] * 100:>+6.1f}%  "
+        f"vol {st['ann_vol'] * 100:>5.1f}%  Sharpe {st['sharpe']:>+5.2f}  "
+        f"maxDD {st['max_drawdown'] * 100:>+6.1f}%  avgPos {st['avg_positions']:>5.1f} "
+        f"({st['pct_invested'] * 100:.0f}% inv)"
+    )
+
+
+def cmd_mrportfolio(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    start: str,
+    end: str,
+    rsi_period: int = 2,
+    entry_rsi: float = 15.0,
+    exit_rsi: float = 70.0,
+    ma_period: int = 200,
+    max_hold: int = 10,
+    min_price: float = 5.0,
+    max_price: float = 1000.0,
+    min_dvol_m: float = 10.0,
+    max_positions: int = 20,
+    cost_bps: float = 10.0,
+    throttle_sec: int | None = None,
+) -> int:
+    """Portfolio-level validation of the RSI-2 mean-reversion edge: run the
+    strategy over the window, book its signals into a `max_positions` equal-weight
+    account, and report the real account curve (CAGR / Sharpe / max-drawdown /
+    capacity) — plus a two-halves robustness split. Per-trade +0.32% is not an
+    account curve; this is."""
+    settings.validate_paper_safety()
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+    cost_frac = cost_bps / 10000.0
+
+    grouped_by_date: dict[str, list[dict[str, Any]]] = {}
+    day = datetime.fromisoformat(start).date()
+    end_d = datetime.fromisoformat(end).date()
+    while day <= end_d:
+        if day.weekday() < 5:
+            iso = day.isoformat()
+            rows = grouped.fetch_grouped(iso)
+            if rows:
+                grouped_by_date[iso] = rows
+            elif throttle:
+                time.sleep(throttle)
+        day += timedelta(days=1)
+
+    panel = build_panel(grouped_by_date)
+    ordered = sorted(panel)
+    if len(ordered) < 60:
+        print(f"mrportfolio {start}..{end}: only {len(ordered)} sessions — widen (MA warmup).")
+        return 0
+    series = _panel_to_series(panel)
+    price = {sym: dict(zip(s["dates"], s["closes"], strict=True)) for sym, s in series.items()}
+    mr_kw = dict(
+        rsi_period=rsi_period,
+        entry_rsi=entry_rsi,
+        exit_rsi=exit_rsi,
+        ma_period=ma_period,
+        max_hold=max_hold,
+        min_price=min_price,
+        max_price=max_price,
+        min_dollar_vol=min_dvol_m * 1_000_000,
+        cost_frac=0.0,
+    )
+    all_trades = _mr_all_trades(series, mr_kw)
+
+    print(
+        f"mrportfolio {start}..{end}: {len(ordered)} sessions, {len(series)} symbols | "
+        f"RSI{rsi_period} ent{entry_rsi:g} ext{exit_rsi:g} ma{ma_period} hold{max_hold} | "
+        f"{len(all_trades)} raw signals | book {max_positions} slots, cost {cost_bps:g}bps/leg"
+    )
+    full = simulate_portfolio(price, all_trades, max_positions, cost_frac)
+    dropped = len(all_trades) - full["stats"]["n_trades"]
+    _print_portfolio_stats("FULL", full["stats"])
+    per_session = len(all_trades) / max(1, len(ordered))
+    print(
+        f"    capacity: {full['stats']['n_trades']}/{len(all_trades)} signals taken "
+        f"({dropped} dropped when book full) — {per_session:.1f} signals/session"
+    )
+
+    # two-halves robustness (split trades by entry date)
+    mid = ordered[len(ordered) // 2]
+    for label, keep in [("2024-H", lambda e: e < mid), ("2025-26H", lambda e: e >= mid)]:
+        sub = [t for t in all_trades if keep(t["entry_date"])]
+        st = simulate_portfolio(price, sub, max_positions, cost_frac)["stats"]
+        _print_portfolio_stats(label, st)
+    print(
+        "  note: capacity-capped equal-weight book; entry/exit cost per leg; "
+        "no borrow needed (long-only, liquid)."
+    )
+    return 0
+
+
 def cmd_calsearch(
     settings: Settings,
     grouped: PolygonGroupedSource,
@@ -2246,6 +2353,24 @@ def main(argv: list[str] | None = None) -> int:
     p_mr.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost, bps per leg")
     p_mr.add_argument("--min-n", type=int, default=30, help="min train trades to keep a combo")
     p_mr.add_argument("--top-k", type=int, default=12)
+    p_mp = sub.add_parser(
+        "mrportfolio",
+        help="portfolio-level validation of the RSI-2 edge (real account curve)",
+    )
+    p_mp.add_argument("--start", required=True, help="window start YYYY-MM-DD")
+    p_mp.add_argument("--end", required=True, help="window end YYYY-MM-DD")
+    p_mp.add_argument("--rsi-period", type=int, default=2)
+    p_mp.add_argument("--entry-rsi", type=float, default=15.0)
+    p_mp.add_argument("--exit-rsi", type=float, default=70.0)
+    p_mp.add_argument("--ma-period", type=int, default=200)
+    p_mp.add_argument("--max-hold", type=int, default=10)
+    p_mp.add_argument("--min-price", type=float, default=5.0)
+    p_mp.add_argument("--max-price", type=float, default=1000.0)
+    p_mp.add_argument("--min-dvol", type=float, default=10.0, help="min $ volume/day, millions")
+    p_mp.add_argument(
+        "--max-positions", type=int, default=20, help="book size (equal-weight slots)"
+    )
+    p_mp.add_argument("--cost-bps", type=float, default=10.0, help="round-trip cost, bps per leg")
     p_cal = sub.add_parser(
         "calsearch",
         help="turn-of-month calendar strategy search over a liquid basket",
@@ -2571,6 +2696,34 @@ def main(argv: list[str] | None = None) -> int:
             cost_bps=args.cost_bps,
             min_n=args.min_n,
             top_k=args.top_k,
+        )
+
+    if args.command == "mrportfolio":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_mrportfolio(
+            settings,
+            grouped,
+            start=args.start,
+            end=args.end,
+            rsi_period=args.rsi_period,
+            entry_rsi=args.entry_rsi,
+            exit_rsi=args.exit_rsi,
+            ma_period=args.ma_period,
+            max_hold=args.max_hold,
+            min_price=args.min_price,
+            max_price=args.max_price,
+            min_dvol_m=args.min_dvol,
+            max_positions=args.max_positions,
+            cost_bps=args.cost_bps,
         )
 
     if args.command == "calsearch":
