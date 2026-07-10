@@ -45,6 +45,7 @@ from src.mean_reversion import mean_reversion_trades, summarize_mr
 from src.minute_bars import MinuteBarsProvider, PolygonMinuteBars
 from src.minute_cache import CachedMinuteBars
 from src.models import PositionState
+from src.mr_live import mr_decisions
 from src.news_source import PolygonNews
 from src.outcomes import compute_outcomes
 from src.portfolio import simulate_portfolio
@@ -1969,6 +1970,160 @@ def cmd_sentsearch(
     return 0
 
 
+def _held_days(entry_iso: str, ordered_dates: list[str]) -> int:
+    """Trading sessions elapsed since a position's entry date."""
+    entry_day = entry_iso[:10]
+    return sum(1 for d in ordered_dates if d > entry_day)
+
+
+def cmd_mr_trade(
+    settings: Settings,
+    grouped: PolygonGroupedSource,
+    market: MarketDataProvider,
+    trading: AlpacaTradingClient,
+    db: Database,
+    rsi_period: int = 2,
+    entry_rsi: float = 15.0,
+    exit_rsi: float = 70.0,
+    ma_period: int = 200,
+    max_hold: int = 10,
+    max_positions: int = 20,
+    min_price: float = 5.0,
+    max_price: float = 1000.0,
+    min_dvol_m: float = 10.0,
+    snapshot_batch: int = 200,
+    throttle_sec: int | None = None,
+) -> int:
+    """Daily RSI-2 mean-reversion paper-trade rebalance. Builds the liquid
+    universe's recent closes (grouped cache) + today's prices (Alpaca snapshots),
+    reconciles open positions, decides SELLs/BUYs via mr_decisions, and routes
+    them through the execution engine — DRY_RUN by default (logs, no orders).
+    Long-only, equal-weight (equity/max_positions), the live form of the validated
+    edge. Founder flips DRY_RUN=false for real paper orders."""
+    settings.validate_paper_safety()
+    throttle = settings.outcome_throttle_sec if throttle_sec is None else throttle_sec
+    run_id = _start_run(settings, db, mode="mr-trade")
+    min_dvol = min_dvol_m * 1_000_000
+
+    # 1) recent closes for the liquid universe (grouped cache; enough for MA warmup)
+    grouped_by_date: dict[str, list[dict[str, Any]]] = {}
+    lookback = ma_period + 10
+    latest = grouped.latest_session(lag_days=0)
+    if not latest:
+        print("mr-trade: no grouped session available.")
+        return 0
+    day = datetime.fromisoformat(latest).date()
+    collected = 0
+    while collected < lookback:
+        if day.weekday() < 5:
+            rows = grouped.fetch_grouped(day.isoformat())
+            if rows:
+                grouped_by_date[day.isoformat()] = rows
+                collected += 1
+        day -= timedelta(days=1)
+        if (datetime.fromisoformat(latest).date() - day).days > lookback * 3:
+            break
+    panel = build_panel(grouped_by_date)
+    ordered = sorted(panel)
+    series = _panel_to_series(panel)
+    # liquid universe: symbols liquid in the latest session, with enough history
+    last_day = panel[ordered[-1]] if ordered else {}
+    universe = {
+        sym
+        for sym, rec in last_day.items()
+        if rec["dollar_vol"] >= min_dvol and min_price <= rec["close"] <= max_price
+    }
+    closes_by_symbol = {s: series[s]["closes"] for s in universe if s in series}
+    dollar_vol = {s: last_day[s]["dollar_vol"] for s in universe}
+
+    # 2) open positions -> held days
+    positions = db.get_open_positions()
+    held = {p["symbol"]: _held_days(p["entry_time"], ordered) for p in positions}
+    pos_by_sym = {p["symbol"]: p for p in positions}
+
+    # 3) current prices via Alpaca snapshots (universe ∪ held), batched
+    want = sorted(universe | set(held))
+    snaps: dict[str, Any] = {}
+    for i in range(0, len(want), snapshot_batch):
+        for s in market.get_snapshots(want[i : i + snapshot_batch]):
+            snaps[s.symbol] = s
+        if throttle and i + snapshot_batch < len(want):
+            time.sleep(throttle)
+    current_price = {sym: s.last_price for sym, s in snaps.items()}
+
+    # 4) decisions
+    dec = mr_decisions(
+        closes_by_symbol,
+        current_price,
+        dollar_vol,
+        held,
+        rsi_period=rsi_period,
+        entry_rsi=entry_rsi,
+        exit_rsi=exit_rsi,
+        ma_period=ma_period,
+        max_hold=max_hold,
+        max_positions=max_positions,
+        min_price=min_price,
+        max_price=max_price,
+        min_dollar_vol=min_dvol,
+    )
+
+    # 5) execute (dry-run by default)
+    engine = ExecutionEngine(
+        trading, db, settings.build_exec_params(), settings.dry_run, log, run_id
+    )
+    account = trading.get_account()
+    equity = float(getattr(account, "equity", 0.0) or 0.0)
+    notional = equity / max_positions if max_positions else 0.0
+    now = datetime.now(UTC)
+
+    n_exit = 0
+    for sym in dec["exits"]:
+        p = pos_by_sym.get(sym)
+        px = current_price.get(sym)
+        if not p or px is None:
+            continue
+        engine.submit_exit(sym, int(p["qty"]), px, "rsi_bounce_or_max_hold")
+        pnl_pct = (px - p["entry_price"]) / p["entry_price"] * 100 if p["entry_price"] else 0.0
+        db.close_position(
+            p["id"],
+            now,
+            px,
+            pnl_pct,
+            pnl_pct / 100 * p["entry_price"] * p["qty"],
+            "rsi_bounce_or_max_hold",
+        )
+        n_exit += 1
+
+    n_entry = 0
+    for sym in dec["entries"]:
+        px = current_price.get(sym)
+        snap = snaps.get(sym)
+        if px is None or snap is None or px <= 0:
+            continue
+        qty = int(notional / px)
+        if qty < 1:
+            continue
+        engine.submit_entry(snap, qty)
+        db.insert_position(sym, now, px, qty, run_id=run_id)
+        n_entry += 1
+
+    mode = "DRY-RUN (no orders)" if settings.dry_run else "LIVE PAPER ORDERS"
+    print(
+        f"mr-trade {latest}: universe {len(closes_by_symbol)} liquid | held {len(held)} | "
+        f"{mode} | equity ${equity:,.0f}"
+    )
+    print(
+        f"  decisions: {n_exit} exit / {n_entry} entry (book {max_positions}, "
+        f"RSI{rsi_period} ent{entry_rsi:g} ext{exit_rsi:g} ma{ma_period} hold{max_hold})"
+    )
+    if dec["exits"]:
+        print(f"  SELL: {', '.join(dec['exits'][:20])}{' …' if len(dec['exits']) > 20 else ''}")
+    if dec["entries"]:
+        print(f"  BUY:  {', '.join(dec['entries'][:20])}{' …' if len(dec['entries']) > 20 else ''}")
+    return 0
+
+
 def cmd_run(
     settings: Settings,
     source: SnapshotSource,
@@ -2397,6 +2552,19 @@ def main(argv: list[str] | None = None) -> int:
         help="only enter when SPY realized vol (annualized) <= this (e.g. 0.20)",
     )
     p_mp.add_argument("--vol-window", type=int, default=20, help="realized-vol lookback (days)")
+    p_mt = sub.add_parser(
+        "mr-trade",
+        help="daily RSI-2 mean-reversion paper-trade rebalance (DRY_RUN by default)",
+    )
+    p_mt.add_argument("--rsi-period", type=int, default=2)
+    p_mt.add_argument("--entry-rsi", type=float, default=15.0)
+    p_mt.add_argument("--exit-rsi", type=float, default=70.0)
+    p_mt.add_argument("--ma-period", type=int, default=200)
+    p_mt.add_argument("--max-hold", type=int, default=10)
+    p_mt.add_argument("--max-positions", type=int, default=20, help="book size (equal-weight)")
+    p_mt.add_argument("--min-price", type=float, default=5.0)
+    p_mt.add_argument("--max-price", type=float, default=1000.0)
+    p_mt.add_argument("--min-dvol", type=float, default=10.0, help="min $ volume/day, millions")
     p_cal = sub.add_parser(
         "calsearch",
         help="turn-of-month calendar strategy search over a liquid basket",
@@ -2753,6 +2921,40 @@ def main(argv: list[str] | None = None) -> int:
             ranked=args.ranked,
             vix_max=args.vix_max,
             vol_window=args.vol_window,
+        )
+
+    if args.command == "mr-trade":
+        try:
+            bounds = ScreenBounds(
+                settings.min_price, settings.max_price, settings.min_day_change_pct
+            )
+            grouped = PolygonGroupedSource(
+                settings.polygon_api_key, bounds, cache_path=settings.grouped_cache_path
+            )
+            market = AlpacaMarketData(
+                settings.alpaca_api_key, settings.alpaca_secret_key, settings.data_feed
+            )
+            trading = AlpacaTradingClient(
+                settings.alpaca_api_key, settings.alpaca_secret_key, paper=True
+            )
+        except RuntimeError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        return cmd_mr_trade(
+            settings,
+            grouped,
+            market,
+            trading,
+            db,
+            rsi_period=args.rsi_period,
+            entry_rsi=args.entry_rsi,
+            exit_rsi=args.exit_rsi,
+            ma_period=args.ma_period,
+            max_hold=args.max_hold,
+            max_positions=args.max_positions,
+            min_price=args.min_price,
+            max_price=args.max_price,
+            min_dvol_m=args.min_dvol,
         )
 
     if args.command == "calsearch":
