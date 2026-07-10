@@ -2,7 +2,7 @@
 # Install (or refresh) the BStalk3r launchd agents for the current user.
 #
 #   com.bstalk3r.daily  -> scan + track + accumulate-shorts (Tue–Sat 09:00 local)
-#   com.bstalk3r.trade  -> RSI-2 mr-trade rebalance (Tue–Sat 05:30 local ≈ US close)
+#   com.bstalk3r.trade  -> RSI-2 mr-trade rebalance (Tue–Sat 04:30 local, before US close)
 #
 # Renders each plist template with this checkout's absolute paths and loads it.
 # Re-run after moving the checkout. Use --uninstall to remove both.
@@ -49,7 +49,7 @@ install_agent "$TRADE_LABEL" "$PROJECT_DIR/scripts/trade.sh" "__TRADE_SH__"
 
 echo
 echo "daily: Tue–Sat 09:00 local (scan + track + accumulate-shorts)"
-echo "trade: Tue–Sat 05:30 local ≈ US close (mr-trade; DRY_RUN honoured)"
+echo "trade: Tue–Sat 04:30 local (KST) = 15:30/14:30 ET, before US close (mr-trade; DRY_RUN honoured)"
 echo "Logs:  ${PROJECT_DIR}/logs/"
 echo
 echo "Run once now to verify:  bash ${PROJECT_DIR}/scripts/trade.sh"

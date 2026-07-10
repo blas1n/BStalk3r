@@ -2036,10 +2036,28 @@ def cmd_mr_trade(
     closes_by_symbol = {s: series[s]["closes"] for s in universe if s in series}
     dollar_vol = {s: last_day[s]["dollar_vol"] for s in universe}
 
-    # 2) open positions -> held days
-    positions = db.get_open_positions()
-    held = {p["symbol"]: _held_days(p["entry_time"], ordered) for p in positions}
-    pos_by_sym = {p["symbol"]: p for p in positions}
+    # 2) open positions -> held days. In LIVE mode Alpaca is the source of truth
+    #    (a limit order may not have filled), with entry dates from our DB; in
+    #    DRY-RUN we track a simulated book in the DB.
+    db_by_sym = {p["symbol"]: p for p in db.get_open_positions()}
+    if settings.dry_run:
+        held = {sym: _held_days(p["entry_time"], ordered) for sym, p in db_by_sym.items()}
+        pos_by_sym = dict(db_by_sym)
+    else:
+        held, pos_by_sym = {}, {}
+        for ap in trading.get_open_positions():
+            sym = getattr(ap, "symbol", None)
+            if not sym:
+                continue
+            dbp = db_by_sym.get(sym)
+            entry_iso = dbp["entry_time"] if dbp else (ordered[-1] if ordered else "")
+            held[sym] = _held_days(entry_iso, ordered)
+            pos_by_sym[sym] = {
+                "id": dbp["id"] if dbp else None,
+                "symbol": sym,
+                "qty": int(float(getattr(ap, "qty", 0) or 0)),
+                "entry_price": float(getattr(ap, "avg_entry_price", 0) or 0),
+            }
 
     # 3) current prices via Alpaca snapshots (universe ∪ held), batched
     want = sorted(universe | set(held))
@@ -2085,14 +2103,15 @@ def cmd_mr_trade(
             continue
         engine.submit_exit(sym, int(p["qty"]), px, "rsi_bounce_or_max_hold")
         pnl_pct = (px - p["entry_price"]) / p["entry_price"] * 100 if p["entry_price"] else 0.0
-        db.close_position(
-            p["id"],
-            now,
-            px,
-            pnl_pct,
-            pnl_pct / 100 * p["entry_price"] * p["qty"],
-            "rsi_bounce_or_max_hold",
-        )
+        if p.get("id") is not None:  # None when Alpaca holds it but our DB doesn't
+            db.close_position(
+                p["id"],
+                now,
+                px,
+                pnl_pct,
+                pnl_pct / 100 * p["entry_price"] * p["qty"],
+                "rsi_bounce_or_max_hold",
+            )
         n_exit += 1
 
     n_entry = 0
