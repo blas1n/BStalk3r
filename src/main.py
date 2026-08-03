@@ -2092,6 +2092,7 @@ def cmd_mr_trade(
     )
     account = trading.get_account()
     equity = float(getattr(account, "equity", 0.0) or 0.0)
+    cash = float(getattr(account, "cash", 0.0) or 0.0)
     notional = equity / max_positions if max_positions else 0.0
     now = datetime.now(UTC)
 
@@ -2114,8 +2115,15 @@ def cmd_mr_trade(
             )
         n_exit += 1
 
-    n_entry = 0
+    # Cap new entries by available cash so the long book never exceeds equity
+    # (no unintended margin). Today's exit proceeds aren't counted until they
+    # settle, so we size conservatively off current cash.
+    affordable = int(max(0.0, cash) / notional) if notional > 0 else 0
+    n_entry, n_skipped = 0, 0
     for sym in dec["entries"]:
+        if n_entry >= affordable:
+            n_skipped += 1
+            continue
         px = current_price.get(sym)
         snap = snaps.get(sym)
         if px is None or snap is None or px <= 0:
@@ -2130,10 +2138,11 @@ def cmd_mr_trade(
     mode = "DRY-RUN (no orders)" if settings.dry_run else "LIVE PAPER ORDERS"
     print(
         f"mr-trade {latest}: universe {len(closes_by_symbol)} liquid | held {len(held)} | "
-        f"{mode} | equity ${equity:,.0f}"
+        f"{mode} | equity ${equity:,.0f} cash ${cash:,.0f}"
     )
+    cap_note = f", {n_skipped} skipped (cash-capped, no margin)" if n_skipped else ""
     print(
-        f"  decisions: {n_exit} exit / {n_entry} entry (book {max_positions}, "
+        f"  decisions: {n_exit} exit / {n_entry} entry{cap_note} (book {max_positions}, "
         f"RSI{rsi_period} ent{entry_rsi:g} ext{exit_rsi:g} ma{ma_period} hold{max_hold})"
     )
     if dec["exits"]:
