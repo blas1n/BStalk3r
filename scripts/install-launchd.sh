@@ -3,6 +3,7 @@
 #
 #   com.bstalk3r.daily  -> scan + track + accumulate-shorts (Tue–Sat 09:00 local)
 #   com.bstalk3r.trade  -> RSI-2 mr-trade rebalance (Tue–Sat 04:30 local, before US close)
+#   com.bstalk3r.report -> weekly paper measurement -> Telegram (Mon 09:30 local)
 #
 # Renders each plist template with this checkout's absolute paths and loads it.
 # Re-run after moving the checkout. Use --uninstall to remove both.
@@ -16,9 +17,10 @@ AGENTS="$HOME/Library/LaunchAgents"
 
 DAILY_LABEL="com.bstalk3r.daily"
 TRADE_LABEL="com.bstalk3r.trade"
+REPORT_LABEL="com.bstalk3r.report"
 
 if [ "${1:-}" = "--uninstall" ]; then
-  for label in "$DAILY_LABEL" "$TRADE_LABEL"; do
+  for label in "$DAILY_LABEL" "$TRADE_LABEL" "$REPORT_LABEL"; do
     dest="$AGENTS/${label}.plist"
     launchctl unload "$dest" 2>/dev/null || true
     rm -f "$dest"
@@ -46,10 +48,12 @@ install_agent() {
 
 install_agent "$DAILY_LABEL" "$PROJECT_DIR/scripts/daily.sh" "__DAILY_SH__"
 install_agent "$TRADE_LABEL" "$PROJECT_DIR/scripts/trade.sh" "__TRADE_SH__"
+install_agent "$REPORT_LABEL" "$PROJECT_DIR/scripts/weekly-report.sh" "__REPORT_SH__"
 
 echo
-echo "daily: Tue–Sat 09:00 local (scan + track + accumulate-shorts)"
-echo "trade: Tue–Sat 04:30 local (KST) = 15:30/14:30 ET, before US close (mr-trade; DRY_RUN honoured)"
+echo "daily:  Tue–Sat 09:00 local (scan + track + accumulate-shorts)"
+echo "trade:  Tue–Sat 04:30 local (KST) = 15:30/14:30 ET, before US close (mr-trade; DRY_RUN honoured)"
+echo "report: Mon 09:30 local — weekly paper measurement pushed to Telegram"
 echo "Logs:  ${PROJECT_DIR}/logs/"
 echo
 echo "Run once now to verify:  bash ${PROJECT_DIR}/scripts/trade.sh"
