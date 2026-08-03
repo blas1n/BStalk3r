@@ -55,12 +55,17 @@ class _FakeMarket:
 
 
 class _FakeAccount:
-    equity = 100_000.0
+    def __init__(self, equity=100_000.0, cash=100_000.0):
+        self.equity = equity
+        self.cash = cash
 
 
 class _FakeTrading:
+    def __init__(self, cash=100_000.0):
+        self._cash = cash
+
     def get_account(self):
-        return _FakeAccount()
+        return _FakeAccount(cash=self._cash)
 
     def submit_limit_order(self, *a, **k):  # not called in dry-run
         raise AssertionError("should not place orders in DRY_RUN")
@@ -176,3 +181,55 @@ def test_mr_trade_live_reads_held_from_alpaca(tmp_path, capsys):
     assert "LIVE PAPER ORDERS" in out and "held 1" in out
     # a real SELL order was routed for the Alpaca-held AAA
     assert any(side == "sell" and sym == "AAA" for sym, side, _ in trading.placed)
+
+
+class _MultiGrouped:
+    """3 liquid names all oversold-in-uptrend at the last session."""
+
+    def __init__(self):
+        self._by = {}
+        for t, ds in enumerate(_DATES):
+            rows = []
+            for s in ("AAA", "BBB", "CCC"):
+                base = 20.0 + 0.5 * t
+                close = base if t < len(_DATES) - 2 else base - 0.6 * (t - (len(_DATES) - 3))
+                rows.append({"T": s, "c": round(close, 2), "v": 5_000_000})
+            self._by[ds] = rows
+
+    def latest_session(self, lag_days=0, _today=None):
+        return _DATES[-1]
+
+    def fetch_grouped(self, d):
+        return self._by.get(d, [])
+
+
+def test_mr_trade_caps_entries_by_available_cash(tmp_path, capsys):
+    # equity 100k, book 5 -> notional 20k. cash only 25k -> affords 1 entry.
+    s = _settings(tmp_path)  # dry-run
+    db = Database(s.db_path)
+    db.init_schema()
+    trading = _FakeTrading(cash=25_000.0)
+    market = _FakeMarket({"AAA": 25.0, "BBB": 25.0, "CCC": 25.0})
+    rc = main_mod.cmd_mr_trade(
+        s,
+        _MultiGrouped(),
+        market,
+        trading,
+        db,
+        rsi_period=2,
+        entry_rsi=100,
+        exit_rsi=70,
+        ma_period=0,  # regime off (RSI-2 oversold is inherently below a short SMA)
+        max_hold=10,
+        max_positions=5,
+        min_price=1.0,
+        max_price=1000.0,
+        min_dvol_m=0.0,
+        throttle_sec=0,
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    # 3 candidates, notional = 100k/5 = 20k; cash 25k -> only 1 affordable
+    orders = db.conn.execute("SELECT COUNT(*) FROM orders WHERE side='buy'").fetchone()[0]
+    assert orders == 1
+    assert "cash-capped" in out
