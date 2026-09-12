@@ -274,7 +274,7 @@ Replay over 5 screened runner(s) @ horizon 3d
 Replay gates on the fields EOD data has (price / day-change / rvol) and leaves
 the intraday-only gates (vol-accel / spread) permissive; once intraday data is
 accumulated (paid Polygon), those become sweepable too. Design notes:
-`~/Docs/BStalk3r/Retrospection_Data_Model_2026-06-10.md`.
+`docs/research/Retrospection_Data_Model_2026-06-10.md`.
 
 **Costs are on by default.** Metrics are *net* of a round-trip transaction-cost
 assumption (`REPLAY_COST_PCT`, default 2%, plus a surcharge for sub-`$REPLAY_CHEAP_PRICE`
@@ -321,7 +321,7 @@ it was tuned on is overfit by construction. With `--train-end`, runners split
 into train (≤) / test (>) and every variant is scored on both; the tool flags
 the *train-best* variant and whether it **holds up or collapses** on the unseen
 test sessions — the real test of whether a parameter edge is genuine.
-Design: `~/Docs/BStalk3r/Retrospection_Data_Model_2026-06-10.md`.
+Design: `docs/research/Retrospection_Data_Model_2026-06-10.md`.
 
 Inspect with any SQLite client:
 
