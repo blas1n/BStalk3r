@@ -63,6 +63,7 @@ from src.sources import (
     WatchlistSource,
     polygon_grouped_crossers,
 )
+from src.splits import split_adjust_panel
 from src.strategy import EntryParams, ExitParams, evaluate_entry, evaluate_exit
 from src.xsectional import build_panel, cross_sectional_backtest, summarize_rebalances
 
@@ -1375,7 +1376,7 @@ def cmd_xsearch(
                 time.sleep(throttle)  # only sleep on a live miss (cached hits are free)
         day += timedelta(days=1)
 
-    panel = build_panel(grouped_by_date)
+    panel = split_adjust_panel(build_panel(grouped_by_date))  # #47: splits aren't P&L
     ordered = sorted(panel)
     if len(ordered) < 10:
         print(f"xsearch {start}..{end}: only {len(ordered)} sessions — widen the window.")
@@ -1520,7 +1521,7 @@ def cmd_mrsearch(
                 time.sleep(throttle)
         day += timedelta(days=1)
 
-    panel = build_panel(grouped_by_date)
+    panel = split_adjust_panel(build_panel(grouped_by_date))  # #47: splits aren't P&L
     ordered = sorted(panel)
     if len(ordered) < 40:
         print(f"mrsearch {start}..{end}: only {len(ordered)} sessions — widen (MA needs warmup).")
@@ -1680,7 +1681,7 @@ def cmd_mrportfolio(
                 time.sleep(throttle)
         day += timedelta(days=1)
 
-    panel = build_panel(grouped_by_date)
+    panel = split_adjust_panel(build_panel(grouped_by_date))  # #47: splits aren't P&L
     ordered = sorted(panel)
     if len(ordered) < 60:
         print(f"mrportfolio {start}..{end}: only {len(ordered)} sessions — widen (MA warmup).")
@@ -1777,7 +1778,7 @@ def cmd_calsearch(
                 time.sleep(throttle)
         day += timedelta(days=1)
 
-    panel = build_panel(grouped_by_date)
+    panel = split_adjust_panel(build_panel(grouped_by_date))  # #47: splits aren't P&L
     if len(panel) < 40:
         print(f"calsearch {start}..{end}: only {len(panel)} sessions — widen.")
         return 0
@@ -1890,7 +1891,7 @@ def cmd_sentsearch(
             articles.extend(news.fetch_day(iso))
         day += timedelta(days=1)
 
-    panel = build_panel(grouped_by_date)
+    panel = split_adjust_panel(build_panel(grouped_by_date))  # #47: splits aren't P&L
     ordered = sorted(panel)
     if len(ordered) < 15:
         print(f"sentsearch {start}..{end}: only {len(ordered)} sessions — widen.")
