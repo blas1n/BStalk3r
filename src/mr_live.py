@@ -32,9 +32,15 @@ def mr_decisions(
     min_price: float = 5.0,
     max_price: float = 1000.0,
     min_dollar_vol: float = 0.0,
+    rank_dollar_vol: dict[str, float] | None = None,
 ) -> dict[str, list[str]]:
     """Decide SELLs (bounce / max-hold) and BUYs (capacity-capped, most-oversold
-    first) for today's close. `held` maps open-position symbol -> days held."""
+    first) for today's close. `held` maps open-position symbol -> days held.
+
+    `dollar_vol` is the liquidity filter input (last session). `rank_dollar_vol`
+    is the R5 tie-break key (20-day average dollar volume, D-1..D-20): candidates
+    sort by RSI ascending, then rank_dollar_vol descending (missing -> last), then
+    symbol ascending, so the pick is deterministic regardless of input order."""
     exits: list[str] = []
     for sym, days in held.items():
         closes = closes_by_symbol.get(sym)
@@ -66,6 +72,35 @@ def mr_decisions(
                 if m is None or cur <= m:
                     continue
             candidates.append((sym, r))
-    candidates.sort(key=lambda x: x[1])  # most oversold first
+    adv = rank_dollar_vol or {}
+
+    def _key(c: tuple[str, float]) -> tuple[float, int, float, str]:
+        sym, r = c
+        v = adv.get(sym)
+        # most oversold first; then larger 20d avg $vol; unknown ADV after known
+        return (r, 0 if v is not None else 1, -(v or 0.0), sym)
+
+    candidates.sort(key=_key)
     entries = [sym for sym, _ in candidates[:free]]
     return {"exits": exits, "entries": entries}
+
+
+def trailing_avg_dollar_vol(
+    panel: dict[str, dict[str, dict[str, float]]], today: str, window: int = 20
+) -> dict[str, float]:
+    """Average dollar volume over the `window` most recent sessions strictly before
+    `today` (D-1..D-window), per symbol — the R5 tie-break key.
+
+    Matches research/tiebreak ADV: a session in the window where the symbol has no
+    bar contributes 0 and the divisor is the number of sessions in the window. If
+    fewer than `window` prior sessions exist in the panel, it averages over the
+    sessions that do exist (the simulator leaves ADV undefined there; live never
+    hits this with its ~210-session lookback)."""
+    sessions = sorted(d for d in panel if d < today)[-window:]
+    if not sessions:
+        return {}
+    totals: dict[str, float] = {}
+    for d in sessions:
+        for sym, rec in panel[d].items():
+            totals[sym] = totals.get(sym, 0.0) + float(rec.get("dollar_vol", 0.0) or 0.0)
+    return {sym: tot / len(sessions) for sym, tot in totals.items()}

@@ -233,3 +233,57 @@ def test_mr_trade_caps_entries_by_available_cash(tmp_path, capsys):
     orders = db.conn.execute("SELECT COUNT(*) FROM orders WHERE side='buy'").fetchone()[0]
     assert orders == 1
     assert "cash-capped" in out
+
+
+class _TieGrouped:
+    """AAA and ZZZ have identical closes (-> identical RSI-2 = tie). AAA has the
+    larger LAST-day dollar volume, ZZZ the larger 20-day average. R5 must pick ZZZ;
+    passing the last-day volume (or nothing -> symbol order) would pick AAA."""
+
+    def __init__(self):
+        self._by = {}
+        n = len(_DATES)
+        for t, ds in enumerate(_DATES):
+            base = 20.0 + 0.5 * t
+            close = base if t < n - 2 else base - 0.6 * (t - (n - 3))
+            last = t == n - 1
+            v_aaa = 9_000_000 if last else 100_000
+            v_zzz = 1_000_000 if last else 5_000_000
+            self._by[ds] = [
+                {"T": "AAA", "c": round(close, 2), "v": v_aaa},
+                {"T": "ZZZ", "c": round(close, 2), "v": v_zzz},
+            ]
+
+    def latest_session(self, lag_days=0, _today=None):
+        return _DATES[-1]
+
+    def fetch_grouped(self, d):
+        return self._by.get(d, [])
+
+
+def test_mr_trade_wires_20d_avg_dollar_vol_into_tie_break(tmp_path, capsys):
+    s = _settings(tmp_path)  # dry-run
+    db = Database(s.db_path)
+    db.init_schema()
+    rc = main_mod.cmd_mr_trade(
+        s,
+        _TieGrouped(),
+        _FakeMarket({"AAA": 25.0, "ZZZ": 25.0}),
+        _FakeTrading(),
+        db,
+        rsi_period=2,
+        entry_rsi=100,
+        exit_rsi=70,
+        ma_period=0,
+        max_hold=10,
+        max_positions=1,  # one slot: the tie-break decides who gets it
+        min_price=1.0,
+        max_price=1000.0,
+        min_dvol_m=0.0,
+        throttle_sec=0,
+    )
+    assert rc == 0
+    bought = [
+        r[0] for r in db.conn.execute("SELECT symbol FROM orders WHERE side='buy'").fetchall()
+    ]
+    assert bought == ["ZZZ"]
