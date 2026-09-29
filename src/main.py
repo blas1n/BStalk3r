@@ -54,7 +54,7 @@ from src.models import PositionState
 from src.mr_live import mr_decisions, trailing_avg_dollar_vol
 from src.news_source import PolygonNews
 from src.outcomes import compute_outcomes
-from src.portfolio import simulate_portfolio
+from src.portfolio import mr_rank_key, simulate_portfolio
 from src.replay import round_trip_cost, simulate
 from src.risk import RiskParams, RiskState, check_entry_allowed, position_size
 from src.scanner import ScanFilters, scan_candidates
@@ -1672,14 +1672,39 @@ def cmd_mrsearch(
 def _mr_all_trades(
     series: dict[str, dict[str, list]], mr_kw: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    """Every RSI-2 trade across all symbols as {symbol, entry_date, exit_date}."""
+    """Every RSI-2 trade across all symbols as {symbol, entry_date, exit_date,
+    entry_rsi, rank_dollar_vol} — the last two are the ranked book's R5 order (#59)."""
+    sessions = sorted({d for s in series.values() for d in s["dates"]})
+    pos = {d: i for i, d in enumerate(sessions)}
     out = []
     for sym, s in series.items():
+        dvol = dict(zip(s["dates"], s["dvols"], strict=True))
         for t in mean_reversion_trades(
             s["dates"], s["closes"], s["dvols"], traded_closes=s["traded"], **mr_kw
         ):  # #55: band on the as-traded close
-            out.append({"symbol": sym, "entry_date": t["entry_date"], "exit_date": t["exit_date"]})
+            window = sessions[max(0, pos[t["entry_date"]] - _R5_WINDOW) : pos[t["entry_date"]]]
+            out.append(
+                {
+                    "symbol": sym,
+                    "entry_date": t["entry_date"],
+                    "exit_date": t["exit_date"],
+                    "entry_rsi": t["entry_rsi"],
+                    "rank_dollar_vol": _avg_dollar_vol(dvol, window),
+                }
+            )
     return out
+
+
+_R5_WINDOW = 20  # sessions D-1..D-20, as live `trailing_avg_dollar_vol`
+
+
+def _avg_dollar_vol(dvol: dict[str, float], window: list[str]) -> float | None:
+    """One symbol's `trailing_avg_dollar_vol` over `window` (the sessions before
+    entry): a session it has no bar contributes 0, the divisor is len(window),
+    and a symbol with no bar in the window has no value (ranks after known)."""
+    if not any(d in dvol for d in window):
+        return None
+    return sum(float(dvol.get(d, 0.0) or 0.0) for d in window) / len(window)
 
 
 def _print_portfolio_stats(label: str, st: dict[str, Any]) -> None:
@@ -1771,7 +1796,7 @@ def cmd_mrportfolio(
         f"({'RANKED by oversold' if ranked else 'first-come'}), cost {cost_bps:g}bps/leg "
         f"| {regime_note}"
     )
-    rank_key = "entry_rsi" if ranked else None
+    rank_key = mr_rank_key if ranked else None
     full = simulate_portfolio(price, all_trades, max_positions, cost_frac, rank_key=rank_key)
     dropped = len(all_trades) - full["stats"]["n_trades"]
     _print_portfolio_stats("FULL", full["stats"])

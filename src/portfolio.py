@@ -10,9 +10,18 @@ positions and split capital across them.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable
 from typing import Any
 
 Prices = dict[str, dict[str, float]]  # {symbol: {date: close}}
+
+
+def mr_rank_key(t: dict[str, Any]) -> tuple[float, int, float, str]:
+    """Same-day admission order of the live selector (`mr_decisions`, R5): entry
+    RSI ascending, then 20-day average dollar volume descending (unknown after
+    known), then symbol. A trade without `entry_rsi` raises — it must not rank."""
+    v = t.get("rank_dollar_vol")
+    return (float(t["entry_rsi"]), 0 if v is not None else 1, -(v or 0.0), t["symbol"])
 
 
 def simulate_portfolio(
@@ -21,7 +30,7 @@ def simulate_portfolio(
     max_positions: int,
     cost_frac: float,
     periods_per_year: int = 252,
-    rank_key: str | None = None,
+    rank_key: str | Callable[[dict[str, Any]], Any] | None = None,
 ) -> dict[str, Any]:
     """Daily equity simulation of `trades` under a `max_positions` equal-weight
     book. Each slot gets 1/max_positions of capital; excess same-day signals are
@@ -29,19 +38,25 @@ def simulate_portfolio(
     charged 1/max_positions per position. Returns {daily: [(date, ret)], stats}.
 
     `rank_key`: when set, same-day signals competing for scarce slots are admitted
-    by ascending trade[rank_key] (e.g. 'entry_rsi' → most-oversold first) instead
-    of first-come."""
+    by ascending trade[rank_key] (e.g. 'entry_rsi' → most-oversold first), or by
+    ascending rank_key(trade) when it is callable (e.g. `mr_rank_key`), instead
+    of first-come. `taken` lists the admitted (entry_date, symbol) in order."""
     dates = sorted({d for s in price.values() for d in s})
     entries_by_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for t in trades:
         entries_by_date[t["entry_date"]].append(t)
-    if rank_key is not None:
+    if callable(rank_key):
         for lst in entries_by_date.values():
-            lst.sort(key=lambda t: t.get(rank_key, 0.0))
+            lst.sort(key=rank_key)
+    elif rank_key is not None:
+        key = rank_key
+        for lst in entries_by_date.values():
+            lst.sort(key=lambda t: t.get(key, 0.0))
 
     open_pos: list[dict[str, Any]] = []
     daily: list[tuple[str, float]] = []
     admitted = 0
+    taken: list[tuple[str, str]] = []  # (entry_date, symbol) admitted, in order
     pos_counts: list[int] = []
 
     for d in dates:
@@ -70,12 +85,14 @@ def simulate_portfolio(
             open_pos.append({"symbol": t["symbol"], "exit_date": t["exit_date"], "_prevd": d})
             cost_today += cost_frac / max_positions
             admitted += 1
+            taken.append((d, t["symbol"]))
             free -= 1
         daily.append((d, day_ret - cost_today))
         pos_counts.append(len(open_pos))
 
     return {
         "daily": daily,
+        "taken": taken,
         "stats": _stats(daily, admitted, pos_counts, max_positions, periods_per_year),
     }
 
