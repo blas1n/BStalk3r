@@ -225,9 +225,11 @@ agent for live (paper) dry-run entries; the schedule template is the model.
 
 ```bash
 uv run pytest --cov=src --cov-fail-under=80   # tests + coverage gate
-uv run ruff check src/ tests/                 # lint
-uv run ruff format src/ tests/                # format
+uv run ruff check .                           # lint
+uv run ruff format --check .                  # format check
 ```
+
+CI (`.github/workflows/ci.yml`) runs exactly these three on every push to main and every PR.
 
 The pure rule modules are exhaustively unit-tested; the loop wiring is covered
 with Alpaca mocked at the boundary. The SDK glue + live commands are verified
