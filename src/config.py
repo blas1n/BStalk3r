@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     grouped_cache_path: str = "data/grouped_cache.db"
     # Persistent per-day news cache (scored Polygon headlines). Empty disables.
     news_cache_path: str = "data/news_cache.db"
+    # Polygon split events (corporate actions) cached per date range, used to
+    # split-adjust backtest closes (#47). Empty disables caching (always fetch).
+    splits_cache_path: str = "data/splits_cache.db"
 
     # universe source: "watchlist" | "polygon"
     universe_source: str = "watchlist"

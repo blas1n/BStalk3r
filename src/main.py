@@ -63,6 +63,7 @@ from src.sources import (
     WatchlistSource,
     polygon_grouped_crossers,
 )
+from src.splits import PolygonSplitSource, SplitSource, adjust_panel
 from src.strategy import EntryParams, ExitParams, evaluate_entry, evaluate_exit
 from src.xsectional import build_panel, cross_sectional_backtest, summarize_rebalances
 
@@ -1350,6 +1351,7 @@ def cmd_xsearch(
     min_n: int = 20,
     top_k: int = 12,
     throttle_sec: int | None = None,
+    splits: SplitSource | None = None,
 ) -> int:
     """Cross-sectional reversal/momentum search over a liquid daily universe.
 
@@ -1375,7 +1377,7 @@ def cmd_xsearch(
                 time.sleep(throttle)  # only sleep on a live miss (cached hits are free)
         day += timedelta(days=1)
 
-    panel = build_panel(grouped_by_date)
+    panel = _split_adjusted(build_panel(grouped_by_date), splits, start, end)  # #47
     ordered = sorted(panel)
     if len(ordered) < 10:
         print(f"xsearch {start}..{end}: only {len(ordered)} sessions — widen the window.")
@@ -1466,6 +1468,19 @@ def cmd_xsearch(
     return 0
 
 
+def _split_adjusted(
+    panel: dict[str, Any], splits: SplitSource | None, start: str, end: str
+) -> dict[str, Any]:
+    """Backtest panel with closes back-adjusted from corporate-action split events
+    (#47); prints how many were applied. No source -> raw closes, said out loud."""
+    if splits is None:
+        print("  splits: UNADJUSTED (no split source) — split days are booked as P&L")
+        return panel
+    adjusted, applied = adjust_panel(panel, splits.fetch_range(start, end))
+    print(f"  splits: {applied} applied (Polygon corporate actions)")
+    return adjusted
+
+
 def _panel_to_series(panel: dict[str, Any]) -> dict[str, dict[str, list]]:
     """Pivot {date:{symbol:{close,dollar_vol}}} to per-symbol time series."""
     series: dict[str, dict[str, list]] = {}
@@ -1497,6 +1512,7 @@ def cmd_mrsearch(
     min_n: int = 30,
     top_k: int = 12,
     throttle_sec: int | None = None,
+    splits: SplitSource | None = None,
 ) -> int:
     """Short-term mean-reversion (RSI-2) search over a liquid universe. Per symbol,
     dip-buy in an uptrend; sweep rsi/entry/exit/ma/hold, bucket trades by entry
@@ -1520,7 +1536,7 @@ def cmd_mrsearch(
                 time.sleep(throttle)
         day += timedelta(days=1)
 
-    panel = build_panel(grouped_by_date)
+    panel = _split_adjusted(build_panel(grouped_by_date), splits, start, end)  # #47
     ordered = sorted(panel)
     if len(ordered) < 40:
         print(f"mrsearch {start}..{end}: only {len(ordered)} sessions — widen (MA needs warmup).")
@@ -1657,6 +1673,7 @@ def cmd_mrportfolio(
     vix_max: float | None = None,
     vol_window: int = 20,
     throttle_sec: int | None = None,
+    splits: SplitSource | None = None,
 ) -> int:
     """Portfolio-level validation of the RSI-2 mean-reversion edge: run the
     strategy over the window, book its signals into a `max_positions` equal-weight
@@ -1680,7 +1697,7 @@ def cmd_mrportfolio(
                 time.sleep(throttle)
         day += timedelta(days=1)
 
-    panel = build_panel(grouped_by_date)
+    panel = _split_adjusted(build_panel(grouped_by_date), splits, start, end)  # #47
     ordered = sorted(panel)
     if len(ordered) < 60:
         print(f"mrportfolio {start}..{end}: only {len(ordered)} sessions — widen (MA warmup).")
@@ -1753,6 +1770,7 @@ def cmd_calsearch(
     cost_bps: float = 10.0,
     top_k: int = 12,
     throttle_sec: int | None = None,
+    splits: SplitSource | None = None,
 ) -> int:
     """Turn-of-Month calendar strategy search. Long an equal-weight liquid basket
     only during the TOM window (last N + first M trading days), flat otherwise;
@@ -1777,7 +1795,7 @@ def cmd_calsearch(
                 time.sleep(throttle)
         day += timedelta(days=1)
 
-    panel = build_panel(grouped_by_date)
+    panel = _split_adjusted(build_panel(grouped_by_date), splits, start, end)  # #47
     if len(panel) < 40:
         print(f"calsearch {start}..{end}: only {len(panel)} sessions — widen.")
         return 0
@@ -1867,6 +1885,7 @@ def cmd_sentsearch(
     min_n: int = 15,
     top_k: int = 12,
     throttle_sec: int | None = None,
+    splits: SplitSource | None = None,
 ) -> int:
     """News-sentiment cross-sectional search. Fetch Polygon news over the window
     (scored + cached), long high-sentiment / short low-sentiment liquid names,
@@ -1890,7 +1909,7 @@ def cmd_sentsearch(
             articles.extend(news.fetch_day(iso))
         day += timedelta(days=1)
 
-    panel = build_panel(grouped_by_date)
+    panel = _split_adjusted(build_panel(grouped_by_date), splits, start, end)  # #47
     ordered = sorted(panel)
     if len(ordered) < 15:
         print(f"sentsearch {start}..{end}: only {len(ordered)} sessions — widen.")
@@ -2913,6 +2932,9 @@ def main(argv: list[str] | None = None) -> int:
             cost_bps=args.cost_bps,
             min_n=args.min_n,
             top_k=args.top_k,
+            splits=PolygonSplitSource(
+                settings.polygon_api_key, cache_path=settings.splits_cache_path
+            ),
         )
 
     if args.command == "mrsearch":
@@ -2944,6 +2966,9 @@ def main(argv: list[str] | None = None) -> int:
             cost_bps=args.cost_bps,
             min_n=args.min_n,
             top_k=args.top_k,
+            splits=PolygonSplitSource(
+                settings.polygon_api_key, cache_path=settings.splits_cache_path
+            ),
         )
 
     if args.command == "mrportfolio":
@@ -2975,6 +3000,9 @@ def main(argv: list[str] | None = None) -> int:
             ranked=args.ranked,
             vix_max=args.vix_max,
             vol_window=args.vol_window,
+            splits=PolygonSplitSource(
+                settings.polygon_api_key, cache_path=settings.splits_cache_path
+            ),
         )
 
     if args.command == "mr-trade":
@@ -3036,6 +3064,9 @@ def main(argv: list[str] | None = None) -> int:
             test_frac=args.test_frac,
             cost_bps=args.cost_bps,
             top_k=args.top_k,
+            splits=PolygonSplitSource(
+                settings.polygon_api_key, cache_path=settings.splits_cache_path
+            ),
         )
 
     if args.command == "sentsearch":
@@ -3068,6 +3099,9 @@ def main(argv: list[str] | None = None) -> int:
             cost_bps=args.cost_bps,
             min_n=args.min_n,
             top_k=args.top_k,
+            splits=PolygonSplitSource(
+                settings.polygon_api_key, cache_path=settings.splits_cache_path
+            ),
         )
 
     if args.command == "replay":
