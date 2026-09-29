@@ -21,6 +21,19 @@ closer to the factor than to "no move". Every earlier close of the symbol is
 multiplied by the factor. The event supplies the ratio, so a split that lands on
 a big real move is still caught, and a real spike with no event is never touched.
 Dollar volume is left raw: close x volume is split-invariant.
+
+Absolute-price filters must not read the restated close: a later 1-for-10
+reverse split lifts a $2 print to $20, inside the $5-1000 band (#55). So a
+record dated before one of its symbol's split events also keeps `traded_close`,
+the close it printed at: the adjusted close divided by each event executing after that
+session which the adjusted series reflects — every event located in the cache,
+and every event the symbol traded across (cached sessions within a week on both
+sides) without a jump, which means the cache had already restated it. An event
+after the last cached session, or in a gap of the symbol's history (ticker
+reuse: PARA), gives no evidence of restatement and is left alone.
+Limit: grouped rows carry no fetch time, so a split after `end` + lookahead
+that a backfilled row already reflects cannot be undone; windows ending at the
+cache's latest session are exact.
 """
 
 from __future__ import annotations
@@ -60,7 +73,8 @@ class SplitSource(Protocol):
 
 def split_adjust_panel(panel: Panel, events: list[SplitEvent]) -> Panel:
     """Copy of a {date: {symbol: {close, dollar_vol, ...}}} panel with each
-    symbol's closes back-adjusted for the split events located in the cache.
+    symbol's closes back-adjusted for the split events located in the cache,
+    plus `traded_close` where the as-traded close differs (#55).
     Consecutive splits compound; other fields are copied unchanged."""
     return adjust_panel(panel, events)[0]
 
@@ -78,16 +92,22 @@ def adjust_panel(panel: Panel, events: list[SplitEvent]) -> tuple[Panel, int]:
         ds = [d for d in dates if sym in panel[d]]
         closes = [panel[d][sym]["close"] for d in ds]
         factors = [1.0] * len(ds)
+        restated = [1.0] * len(ds)  # adjusted / as-traded
         for ev in evs:
             k = _locate_boundary(ds, closes, ev)
-            if k is None:
-                continue
-            applied += 1
-            for i in range(k):
-                factors[i] *= ev.price_factor
-        for d, c, f in zip(ds, closes, factors, strict=True):
+            if k is not None:
+                applied += 1
+                for i in range(k):
+                    factors[i] *= ev.price_factor
+            if k is not None or _straddles(ds, ev.execution_date):
+                for i, d in enumerate(ds):
+                    if d < ev.execution_date:
+                        restated[i] *= ev.price_factor
+        for d, c, f, r in zip(ds, closes, factors, restated, strict=True):
             if f != 1.0:
                 out[d][sym]["close"] = c * f
+            if r != 1.0:
+                out[d][sym]["traded_close"] = c * f / r
     return out, applied
 
 
@@ -110,6 +130,18 @@ def _locate_boundary(ds: list[str], closes: list[float], ev: SplitEvent) -> int 
         if dist < abs(x) and (best is None or dist < best[0]):
             best = (dist, k)
     return best[1] if best else None
+
+
+def _straddles(ds: list[str], execution_date: str) -> bool:
+    """The symbol has cached sessions within a week on both sides of the
+    execution date, so "no jump there" is evidence the earlier rows were
+    restated. A gap (ticker reuse, halt) gives no such evidence."""
+    i = _bisect_left(ds, execution_date)
+    return (
+        0 < i < len(ds)
+        and ds[i - 1] >= _minus_days(execution_date, 7)
+        and ds[i] <= _minus_days(execution_date, -7)
+    )
 
 
 def _bisect_left(ds: list[str], key: str) -> int:

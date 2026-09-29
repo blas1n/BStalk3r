@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from src.xsectional import RebalanceResult
+from src.xsectional import RebalanceResult, traded_close
 
 # Compact finance-news sentiment lexicon (headline-oriented).
 _POS = {
@@ -207,7 +207,9 @@ def sentiment_backtest(
             if not fut:
                 continue
             price = cur["close"]
-            if not (min_price <= price <= max_price) or cur["dollar_vol"] < min_dollar_vol:
+            if not (min_price <= traded_close(cur) <= max_price) or (
+                cur["dollar_vol"] < min_dollar_vol
+            ):
                 continue
             rs = _recent_sentiment(sentiment, sym, dates, i, formation_days)
             if rs is None or rs[1] < min_articles or price <= 0:
