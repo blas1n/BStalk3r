@@ -58,8 +58,10 @@ Caveats that are part of this registration:
 
 - **Window:** from the first live `mr-trade` run after this change deploys (expected
   2026-09-30) through **2026-12-31**, inclusive.
-- **Start equity:** `<<PLACEHOLDER — main session to fill: paper account equity at the
-  2026-09-29 close, from Alpaca portfolio history (the DB has no equity snapshot)>>`
+- **Start equity:** the paper account equity at the close of the session immediately before
+  the first live run in the window, read from Alpaca portfolio history at evaluation time
+  (the same source as the end value; the DB has no equity snapshot). Cross-check it against
+  the `equity $…` value printed by that first run in `logs/trade-<date>.log`.
 - **Live return:** paper account equity at the last close in the window divided by the start
   equity, minus 1. Take both values from Alpaca portfolio history, and net out any deposits or
   withdrawals.
