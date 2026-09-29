@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     # Polygon split events (corporate actions) cached per date range, used to
     # split-adjust backtest closes (#47). Empty disables caching (always fetch).
     splits_cache_path: str = "data/splits_cache.db"
+    # Polygon ticker events (current holder's ticker changes) cached per ticker,
+    # used to split a reused ticker's series in backtests (#58). Empty disables.
+    identity_cache_path: str = "data/identity_cache.db"
 
     # universe source: "watchlist" | "polygon"
     universe_source: str = "watchlist"

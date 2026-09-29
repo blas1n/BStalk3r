@@ -30,6 +30,12 @@ from src.execution import ExecutionEngine
 from src.exhaustion import find_exhaustion_shorts
 from src.exhaustion_intraday import qualifying_run_ends, simulate_run_end_short
 from src.forward_bars import ForwardBarsProvider, PolygonDailyBars
+from src.identity import (
+    IdentitySource,
+    PolygonIdentitySource,
+    identity_breaks,
+    split_identities,
+)
 from src.intraday import (
     aggregate,
     bucket_by_feature,
@@ -1357,6 +1363,7 @@ def cmd_xsearch(
     top_k: int = 12,
     throttle_sec: int | None = None,
     splits: SplitSource | None = None,
+    identity: IdentitySource | None = None,
 ) -> int:
     """Cross-sectional reversal/momentum search over a liquid daily universe.
 
@@ -1383,6 +1390,7 @@ def cmd_xsearch(
         day += timedelta(days=1)
 
     panel = _split_adjusted(build_panel(grouped_by_date), splits, start, end)  # #47
+    panel = _identity_split(panel, identity, min_dollar_vol)  # #58
     ordered = sorted(panel)
     if len(ordered) < 10:
         print(f"xsearch {start}..{end}: only {len(ordered)} sessions — widen the window.")
@@ -1486,6 +1494,23 @@ def _split_adjusted(
     return adjusted
 
 
+def _identity_split(
+    panel: dict[str, Any], identity: IdentitySource | None, min_dollar_vol: float
+) -> dict[str, Any]:
+    """Backtest panel with each reused ticker's earlier company renamed at its
+    identity break (#58); prints how many. No source -> joined series, said out loud."""
+    if identity is None:
+        print("  identity: UNCHECKED (no identity source) — a reused ticker joins two companies")
+        return panel
+    breaks, looked = identity_breaks(panel, identity, min_dollar_vol)
+    plural = "" if len(breaks) == 1 else "s"
+    print(
+        f"  identity: {len(breaks)} reused ticker{plural} split "
+        f"({looked} gapped tickers checked against Polygon ticker events)"
+    )
+    return split_identities(panel, breaks)
+
+
 def _panel_to_series(panel: dict[str, Any]) -> dict[str, dict[str, list]]:
     """Pivot {date:{symbol:{close,dollar_vol}}} to per-symbol time series;
     `traded` is the as-traded close the backtests band on (#55)."""
@@ -1520,6 +1545,7 @@ def cmd_mrsearch(
     top_k: int = 12,
     throttle_sec: int | None = None,
     splits: SplitSource | None = None,
+    identity: IdentitySource | None = None,
 ) -> int:
     """Short-term mean-reversion (RSI-2) search over a liquid universe. Per symbol,
     dip-buy in an uptrend; sweep rsi/entry/exit/ma/hold, bucket trades by entry
@@ -1544,6 +1570,7 @@ def cmd_mrsearch(
         day += timedelta(days=1)
 
     panel = _split_adjusted(build_panel(grouped_by_date), splits, start, end)  # #47
+    panel = _identity_split(panel, identity, min_dvol)  # #58
     ordered = sorted(panel)
     if len(ordered) < 40:
         print(f"mrsearch {start}..{end}: only {len(ordered)} sessions — widen (MA needs warmup).")
@@ -1709,6 +1736,7 @@ def cmd_mrportfolio(
     vol_window: int = 20,
     throttle_sec: int | None = None,
     splits: SplitSource | None = None,
+    identity: IdentitySource | None = None,
 ) -> int:
     """Portfolio-level validation of the RSI-2 mean-reversion edge: run the
     strategy over the window, book its signals into a `max_positions` equal-weight
@@ -1733,6 +1761,7 @@ def cmd_mrportfolio(
         day += timedelta(days=1)
 
     panel = _split_adjusted(build_panel(grouped_by_date), splits, start, end)  # #47
+    panel = _identity_split(panel, identity, min_dvol_m * 1_000_000)  # #58
     ordered = sorted(panel)
     if len(ordered) < 60:
         print(f"mrportfolio {start}..{end}: only {len(ordered)} sessions — widen (MA warmup).")
@@ -1806,6 +1835,7 @@ def cmd_calsearch(
     top_k: int = 12,
     throttle_sec: int | None = None,
     splits: SplitSource | None = None,
+    identity: IdentitySource | None = None,
 ) -> int:
     """Turn-of-Month calendar strategy search. Long an equal-weight liquid basket
     only during the TOM window (last N + first M trading days), flat otherwise;
@@ -1831,6 +1861,7 @@ def cmd_calsearch(
         day += timedelta(days=1)
 
     panel = _split_adjusted(build_panel(grouped_by_date), splits, start, end)  # #47
+    panel = _identity_split(panel, identity, min_dvol)  # #58
     if len(panel) < 40:
         print(f"calsearch {start}..{end}: only {len(panel)} sessions — widen.")
         return 0
@@ -1921,6 +1952,7 @@ def cmd_sentsearch(
     top_k: int = 12,
     throttle_sec: int | None = None,
     splits: SplitSource | None = None,
+    identity: IdentitySource | None = None,
 ) -> int:
     """News-sentiment cross-sectional search. Fetch Polygon news over the window
     (scored + cached), long high-sentiment / short low-sentiment liquid names,
@@ -1945,6 +1977,7 @@ def cmd_sentsearch(
         day += timedelta(days=1)
 
     panel = _split_adjusted(build_panel(grouped_by_date), splits, start, end)  # #47
+    panel = _identity_split(panel, identity, min_dvol)  # #58
     ordered = sorted(panel)
     if len(ordered) < 15:
         print(f"sentsearch {start}..{end}: only {len(ordered)} sessions — widen.")
@@ -2970,6 +3003,11 @@ def main(argv: list[str] | None = None) -> int:
             splits=PolygonSplitSource(
                 settings.polygon_api_key, cache_path=settings.splits_cache_path
             ),
+            identity=PolygonIdentitySource(
+                settings.polygon_api_key,
+                cache_path=settings.identity_cache_path,
+                throttle_sec=settings.outcome_throttle_sec,
+            ),
         )
 
     if args.command == "mrsearch":
@@ -3004,6 +3042,11 @@ def main(argv: list[str] | None = None) -> int:
             splits=PolygonSplitSource(
                 settings.polygon_api_key, cache_path=settings.splits_cache_path
             ),
+            identity=PolygonIdentitySource(
+                settings.polygon_api_key,
+                cache_path=settings.identity_cache_path,
+                throttle_sec=settings.outcome_throttle_sec,
+            ),
         )
 
     if args.command == "mrportfolio":
@@ -3037,6 +3080,11 @@ def main(argv: list[str] | None = None) -> int:
             vol_window=args.vol_window,
             splits=PolygonSplitSource(
                 settings.polygon_api_key, cache_path=settings.splits_cache_path
+            ),
+            identity=PolygonIdentitySource(
+                settings.polygon_api_key,
+                cache_path=settings.identity_cache_path,
+                throttle_sec=settings.outcome_throttle_sec,
             ),
         )
 
@@ -3102,6 +3150,11 @@ def main(argv: list[str] | None = None) -> int:
             splits=PolygonSplitSource(
                 settings.polygon_api_key, cache_path=settings.splits_cache_path
             ),
+            identity=PolygonIdentitySource(
+                settings.polygon_api_key,
+                cache_path=settings.identity_cache_path,
+                throttle_sec=settings.outcome_throttle_sec,
+            ),
         )
 
     if args.command == "sentsearch":
@@ -3136,6 +3189,11 @@ def main(argv: list[str] | None = None) -> int:
             top_k=args.top_k,
             splits=PolygonSplitSource(
                 settings.polygon_api_key, cache_path=settings.splits_cache_path
+            ),
+            identity=PolygonIdentitySource(
+                settings.polygon_api_key,
+                cache_path=settings.identity_cache_path,
+                throttle_sec=settings.outcome_throttle_sec,
             ),
         )
 
