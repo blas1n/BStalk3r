@@ -39,6 +39,9 @@ filterwarnings = ["ignore::DeprecationWarning"]
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
+# research/ holds one-off numpy study scripts (not production, not imported by src);
+# kept verbatim so results stay reproducible. Coverage already measures src/ only.
+extend-exclude = ["research"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "W"]

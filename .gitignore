@@ -10,6 +10,8 @@
 data/
 logs/
 reports/
+research/**/*.npz
+research/**/*.json
 
 # Python
 __pycache__/
