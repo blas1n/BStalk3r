@@ -45,7 +45,7 @@ from src.mean_reversion import mean_reversion_trades, summarize_mr
 from src.minute_bars import MinuteBarsProvider, PolygonMinuteBars
 from src.minute_cache import CachedMinuteBars
 from src.models import PositionState
-from src.mr_live import mr_decisions
+from src.mr_live import mr_decisions, trailing_avg_dollar_vol
 from src.news_source import PolygonNews
 from src.outcomes import compute_outcomes
 from src.portfolio import simulate_portfolio
@@ -2034,7 +2034,9 @@ def cmd_mr_trade(
         if rec["dollar_vol"] >= min_dvol and min_price <= rec["close"] <= max_price
     }
     closes_by_symbol = {s: series[s]["closes"] for s in universe if s in series}
-    dollar_vol = {s: last_day[s]["dollar_vol"] for s in universe}
+    dollar_vol = {s: last_day[s]["dollar_vol"] for s in universe}  # liquidity filter
+    # R5 tie-break key: 20-day avg $vol over completed sessions before today (ET)
+    avg_dvol_20 = trailing_avg_dollar_vol(panel, datetime.now(_ET).date().isoformat(), 20)
 
     # 2) open positions -> held days. In LIVE mode Alpaca is the source of truth
     #    (a limit order may not have filled), with entry dates from our DB; in
@@ -2084,6 +2086,7 @@ def cmd_mr_trade(
         min_price=min_price,
         max_price=max_price,
         min_dollar_vol=min_dvol,
+        rank_dollar_vol=avg_dvol_20,
     )
 
     # 5) execute (dry-run by default)
