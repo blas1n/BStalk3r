@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+from src.xsectional import traded_close
+
 
 def classify_tom(dates: list[str], days_before: int, days_after: int) -> set[str]:
     """Set of dates in the turn-of-month window: the last `days_before` trading
@@ -46,7 +48,9 @@ def equal_weight_returns(
             if not p or p["close"] <= 0:
                 continue
             price = rec["close"]
-            if not (min_price <= price <= max_price) or rec["dollar_vol"] < min_dollar_vol:
+            if not (min_price <= traded_close(rec) <= max_price) or (
+                rec["dollar_vol"] < min_dollar_vol
+            ):
                 continue
             rets.append(price / p["close"] - 1.0)
         if rets:

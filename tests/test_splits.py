@@ -106,17 +106,24 @@ def test_boundary_on_the_execution_date_itself():
 def test_already_adjusted_history_is_not_adjusted_twice():
     """KORU 2025-02-10 1:10 reverse split: the rows were backfilled after the
     split, so the cache shows no jump. Applying the event again would multiply
-    the history by 10."""
+    the history by 10. (It still traded at ~$4 before the split: #55 records
+    that as `traded_close` for the price band; closes and $vol are untouched.)"""
     raw = [40.7, 42.3, 42.6, 40.1, 42.38, 42.38, 42.36, 45.11]
     panel = _panel(raw, sym="KORU")
-    assert split_adjust_panel(panel, [_event(4, 10, 1, "KORU")]) == panel
+    out = split_adjust_panel(panel, [_event(4, 10, 1, "KORU")])
+    assert _closes(out, "KORU") == raw
+    assert [out[d]["KORU"]["dollar_vol"] for d in sorted(out)] == [c * 1e6 for c in raw]
+    assert [out[d]["KORU"].get("traded_close") for d in sorted(out)] == pytest.approx(
+        [c / 10 for c in raw[:4]] + [None] * 4
+    )
 
 
 def test_jump_far_from_the_execution_date_is_not_attributed_to_the_split():
     raw = _rising(factor=0.1, split_at=10)
     panel = _panel(raw)
     # event 11 sessions after the jump: out of the as-of window -> not applied
-    assert split_adjust_panel(panel, [_event(21, 1, 10)]) == panel
+    # (closes; the no-jump-at-the-event reading only moves `traded_close`, #55)
+    assert _closes(split_adjust_panel(panel, [_event(21, 1, 10)])) == raw
 
 
 def test_event_outside_the_cached_range_is_a_noop():

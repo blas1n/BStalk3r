@@ -27,6 +27,14 @@ class RebalanceResult:
     n_short: int
 
 
+def traded_close(rec: dict[str, Any]) -> float:
+    """The close the name actually printed at on that session. Split-adjusted
+    panels (#47) restate `close` in today's units and keep the as-traded value in
+    `traded_close` where they differ (#55); absolute-price filters (the $ band)
+    read this, returns read `close`."""
+    return float(rec.get("traded_close", rec["close"]))
+
+
 def build_panel(grouped_by_date: dict[str, list[dict[str, Any]]]) -> Panel:
     """{date: {symbol: {close, dollar_vol}}} from grouped rows (T/c/v)."""
     panel: Panel = {}
@@ -69,7 +77,9 @@ def cross_sectional_backtest(
             if not past or not fut:
                 continue
             price = cur["close"]
-            if not (min_price <= price <= max_price) or cur["dollar_vol"] < min_dollar_vol:
+            if not (min_price <= traded_close(cur) <= max_price) or (
+                cur["dollar_vol"] < min_dollar_vol
+            ):
                 continue
             if past["close"] <= 0 or price <= 0:
                 continue

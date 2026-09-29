@@ -65,7 +65,12 @@ from src.sources import (
 )
 from src.splits import PolygonSplitSource, SplitSource, adjust_panel
 from src.strategy import EntryParams, ExitParams, evaluate_entry, evaluate_exit
-from src.xsectional import build_panel, cross_sectional_backtest, summarize_rebalances
+from src.xsectional import (
+    build_panel,
+    cross_sectional_backtest,
+    summarize_rebalances,
+    traded_close,
+)
 
 _ET = ZoneInfo("America/New_York")
 log = structlog.get_logger("bstalk3r")
@@ -1482,14 +1487,16 @@ def _split_adjusted(
 
 
 def _panel_to_series(panel: dict[str, Any]) -> dict[str, dict[str, list]]:
-    """Pivot {date:{symbol:{close,dollar_vol}}} to per-symbol time series."""
+    """Pivot {date:{symbol:{close,dollar_vol}}} to per-symbol time series;
+    `traded` is the as-traded close the backtests band on (#55)."""
     series: dict[str, dict[str, list]] = {}
     for d in sorted(panel):
         for sym, rec in panel[d].items():
-            s = series.setdefault(sym, {"dates": [], "closes": [], "dvols": []})
+            s = series.setdefault(sym, {"dates": [], "closes": [], "dvols": [], "traded": []})
             s["dates"].append(d)
             s["closes"].append(rec["close"])
             s["dvols"].append(rec["dollar_vol"])
+            s["traded"].append(traded_close(rec))
     return series
 
 
@@ -1570,6 +1577,7 @@ def cmd_mrsearch(
                 max_price=max_price,
                 min_dollar_vol=min_dvol,
                 cost_frac=cost_frac,
+                traded_closes=s["traded"],  # #55: band on the as-traded close
             ):
                 for name, dates in split.items():
                     if t["entry_date"] in dates:
@@ -1640,7 +1648,9 @@ def _mr_all_trades(
     """Every RSI-2 trade across all symbols as {symbol, entry_date, exit_date}."""
     out = []
     for sym, s in series.items():
-        for t in mean_reversion_trades(s["dates"], s["closes"], s["dvols"], **mr_kw):
+        for t in mean_reversion_trades(
+            s["dates"], s["closes"], s["dvols"], traded_closes=s["traded"], **mr_kw
+        ):  # #55: band on the as-traded close
             out.append({"symbol": sym, "entry_date": t["entry_date"], "exit_date": t["exit_date"]})
     return out
 
