@@ -99,6 +99,23 @@ printed by `--window` mode.
 - The simulator uses split-adjusted closes. Live uses the grouped cache plus the Alpaca
   snapshot price.
 
+## Addendum A (2026-09-29, before the window opened): hold-day alignment (#48)
+
+Deployed before the first live run of the window (2026-09-30 04:30 KST). Live `mr-trade`
+counted held days only from grouped-cache sessions, and at the ~15:30 ET run the cache ends
+at the previous session, so "max hold 10" force-exited on session D+11 (the paper DB shows
+11 closed positions held 11 sessions, none longer). The backtest (`mean_reversion_trades`,
+`bt.all_signals`) exits at bar i+10, and the simulator modelled live's behaviour with
+`HOLD_LIVE = 11`. Live now counts the session being traded (`_held_days`: entry session D is
+day 0, force exit on D+10). The simulator is changed in the same commit to `HOLD_LIVE = 10`
+(and `bt.portfolio` `hold_live = HOLD`), so live, the simulator and the backtest share one
+definition. This is a bug fix to the stated rule (max hold 10), not a parameter change. The
+prospective evaluation uses the simulator as of this addendum. Re-running the study on the
+same 2026-09-29 cache (300 seeds; hold 11 reproduces the table above exactly) gives, at
+hold 10, R5 return / Sharpe / pct: train +17.1% / 1.09 / 82nd, test +6.5% / 0.97 / 89th,
+holdout +11.1% / 1.60 / 98th, paper window +6.4% / 1.15 / 86th (R0 medians +9.1%, +0.1%,
++0.5%, +1.7%). The selection rule still picks R2. The conclusions above do not change.
+
 ## Result
 
 _To be filled after 2026-12-31: R0 distribution, R5 return and pct, live return and pct,

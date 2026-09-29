@@ -44,7 +44,7 @@ def stats(rets):
             f"med={np.median(r)*100:+.2f}% win={(r>0).mean()*100:.1f}% n|r|>50%={(np.abs(r)>0.5).sum()}")
 
 
-def portfolio(P, start, end, slots=20, hold_live=HOLD + 1, seed=None, cash_cap=True, tie="random"):
+def portfolio(P, start, end, slots=20, hold_live=HOLD, seed=None, cash_cap=True, tie="random"):
     """Live mr-trade rules: decide & fill at close D; exits RSI>=70 or held>=hold_live
     sessions; entries most-oversold first (ties random), capped by free slots and
     by pre-exit cash / (equity/slots). Equal weight = equity/slots."""

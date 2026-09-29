@@ -19,7 +19,7 @@ if ARGS.panel:
     os.environ["TIEBREAK_PANEL"] = ARGS.panel
 from core import *  # noqa  (run from this directory: `cd research/tiebreak`)
 
-ENT, EXT, HOLD_LIVE, SLOTS = 15.0, 70.0, 11, 20  # HOLD_LIVE=11 as in bt.portfolio (live max_hold 10)
+ENT, EXT, HOLD_LIVE, SLOTS = 15.0, 70.0, 10, 20  # live max_hold 10: exit on session e+10 (#48)
 PA = build(True)
 C, Cf, R, M, DV = PA["C"], PA["Cf"], PA["R"], PA["M"], PA["DV"]
 

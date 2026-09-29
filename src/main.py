@@ -1970,10 +1970,31 @@ def cmd_sentsearch(
     return 0
 
 
-def _held_days(entry_iso: str, ordered_dates: list[str]) -> int:
-    """Trading sessions elapsed since a position's entry date."""
-    entry_day = entry_iso[:10]
-    return sum(1 for d in ordered_dates if d > entry_day)
+def _today_et() -> str:
+    """The US session date being traded (ET calendar date)."""
+    return datetime.now(_ET).date().isoformat()
+
+
+def _entry_session(entry_iso: str) -> str:
+    """ET session date of a stored entry timestamp (UTC ISO, or a bare date)."""
+    try:
+        dt = datetime.fromisoformat(entry_iso)
+    except ValueError:
+        return entry_iso[:10]
+    if dt.tzinfo is None:
+        return entry_iso[:10]
+    return dt.astimezone(_ET).date().isoformat()
+
+
+def _held_days(entry_iso: str, ordered_dates: list[str], today: str) -> int:
+    """Sessions held as of today's run, counted like the backtest: entry at the
+    close of session D is day 0 and the run on session D+k sees k, so `max_hold`
+    force-exits on D+max_hold (`mean_reversion_trades`: exit bar j with j - i >=
+    max_hold). The grouped cache at the ~15:30 ET run only holds sessions completed
+    before today, so today is counted explicitly (and not twice if cached)."""
+    entry_day = _entry_session(entry_iso)
+    past = sum(1 for d in ordered_dates if entry_day < d < today)
+    return past + (1 if today > entry_day else 0)
 
 
 def cmd_mr_trade(
@@ -2036,14 +2057,15 @@ def cmd_mr_trade(
     closes_by_symbol = {s: series[s]["closes"] for s in universe if s in series}
     dollar_vol = {s: last_day[s]["dollar_vol"] for s in universe}  # liquidity filter
     # R5 tie-break key: 20-day avg $vol over completed sessions before today (ET)
-    avg_dvol_20 = trailing_avg_dollar_vol(panel, datetime.now(_ET).date().isoformat(), 20)
+    today = _today_et()
+    avg_dvol_20 = trailing_avg_dollar_vol(panel, today, 20)
 
     # 2) open positions -> held days. In LIVE mode Alpaca is the source of truth
     #    (a limit order may not have filled), with entry dates from our DB; in
     #    DRY-RUN we track a simulated book in the DB.
     db_by_sym = {p["symbol"]: p for p in db.get_open_positions()}
     if settings.dry_run:
-        held = {sym: _held_days(p["entry_time"], ordered) for sym, p in db_by_sym.items()}
+        held = {sym: _held_days(p["entry_time"], ordered, today) for sym, p in db_by_sym.items()}
         pos_by_sym = dict(db_by_sym)
     else:
         held, pos_by_sym = {}, {}
@@ -2052,8 +2074,9 @@ def cmd_mr_trade(
             if not sym:
                 continue
             dbp = db_by_sym.get(sym)
-            entry_iso = dbp["entry_time"] if dbp else (ordered[-1] if ordered else "")
-            held[sym] = _held_days(entry_iso, ordered)
+            # unknown to our DB -> treat as entered today (held 0), as before
+            entry_iso = dbp["entry_time"] if dbp else today
+            held[sym] = _held_days(entry_iso, ordered, today)
             pos_by_sym[sym] = {
                 "id": dbp["id"] if dbp else None,
                 "symbol": sym,

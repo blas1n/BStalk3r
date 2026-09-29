@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+import pytest
 import src.main as main_mod
 from src.config import Settings
 from src.database import Database
@@ -287,3 +288,102 @@ def test_mr_trade_wires_20d_avg_dollar_vol_into_tie_break(tmp_path, capsys):
         r[0] for r in db.conn.execute("SELECT symbol FROM orders WHERE side='buy'").fetchall()
     ]
     assert bought == ["ZZZ"]
+
+
+class _AsOfGrouped:
+    """AAA grinds down for the whole window (RSI-2 stays at 0, never bounces).
+    The cache only holds sessions completed before `today`, as at the 15:30 ET run:
+    `latest_session` is the session *before* the one being traded."""
+
+    def __init__(self, latest: str):
+        self._latest = latest
+        self._by = {
+            ds: [{"T": "AAA", "c": round(40.0 - 0.5 * t, 2), "v": 5_000_000}]
+            for t, ds in enumerate(_DATES)
+            if ds <= latest
+        }
+
+    def latest_session(self, lag_days=0, _today=None):
+        return self._latest
+
+    def fetch_grouped(self, d):
+        return self._by.get(d, [])
+
+
+def _run_max_hold_day(
+    tmp_path, monkeypatch, entry_idx: int, today_idx: int, live: bool = False
+) -> list[str]:
+    """mr-trade on session `_DATES[today_idx]` holding AAA bought at the close of
+    `_DATES[entry_idx]` (dry-run DB book, or LIVE with Alpaca holding it and the
+    entry date from our DB). Returns the symbols sold."""
+    from datetime import UTC, datetime
+
+    monkeypatch.setattr(main_mod, "_today_et", lambda: _DATES[today_idx], raising=False)
+    s = _settings(tmp_path, dry_run=not live)
+    db = Database(s.db_path)
+    db.init_schema()
+    entry_day = date.fromisoformat(_DATES[entry_idx])
+    # 15:30 ET fill = 19:30 UTC (EST: 20:30) -> same calendar date as the ET session
+    entry_ts = datetime(entry_day.year, entry_day.month, entry_day.day, 20, 30, tzinfo=UTC)
+    db.insert_position("AAA", entry_ts, 38.0, 10)
+    trading = _LiveTrading([_AlpacaPos("AAA", 10, 38.0)]) if live else _FakeTrading()
+    rc = main_mod.cmd_mr_trade(
+        s,
+        _AsOfGrouped(_DATES[today_idx - 1]),
+        _FakeMarket({"AAA": 1.0}),  # still falling -> RSI-2 0, no bounce exit
+        trading,
+        db,
+        entry_rsi=-1,  # no new entries; this test is only about the hold clock
+        exit_rsi=70,
+        ma_period=0,
+        max_hold=10,
+        max_positions=5,
+        min_price=0.5,
+        min_dvol_m=0.0,
+        throttle_sec=0,
+    )
+    assert rc == 0
+    if live:
+        return [sym for sym, side, _ in trading.placed if side == "sell"]
+    return [r[0] for r in db.conn.execute("SELECT symbol FROM orders WHERE side='sell'").fetchall()]
+
+
+@pytest.mark.parametrize("live", [False, True], ids=["dry_run_book", "live_alpaca"])
+def test_mr_trade_force_exits_on_same_session_as_backtest(tmp_path, monkeypatch, live):
+    # Backtest definition (mean_reversion_trades): entry at bar i's close, forced exit
+    # at bar i + max_hold. The live run on that session must sell, not one session later.
+    from src.mean_reversion import mean_reversion_trades
+
+    entry_idx, max_hold = 2, 10
+    closes = [40.0 - 0.5 * t for t in range(len(_DATES))]
+    bt = mean_reversion_trades(
+        _DATES,
+        closes,
+        [1e9] * len(_DATES),
+        entry_rsi=100,
+        exit_rsi=101,
+        ma_period=0,
+        max_hold=max_hold,
+        min_price=0.0,
+    )
+    first = next(t for t in bt if t["entry_date"] == _DATES[entry_idx])
+    assert first["exit_date"] == _DATES[entry_idx + max_hold]
+
+    got = _run_max_hold_day(tmp_path, monkeypatch, entry_idx, entry_idx + max_hold, live)
+    assert got == ["AAA"]
+
+
+@pytest.mark.parametrize("live", [False, True], ids=["dry_run_book", "live_alpaca"])
+def test_mr_trade_holds_through_the_session_before_max_hold(tmp_path, monkeypatch, live):
+    # control: one session earlier the position is still held (held = max_hold - 1)
+    assert _run_max_hold_day(tmp_path, monkeypatch, 2, 2 + 10 - 1, live) == []
+
+
+def test_held_days_counts_the_traded_session_not_just_cached_ones():
+    # entry on D; the cache holds D..D+8 at the D+9 run -> held 9 (backtest j - i)
+    ordered = _DATES[2:11]
+    assert main_mod._held_days("2026-01-07T20:30:00+00:00", ordered, _DATES[11]) == 9
+    # a cache that already has today (after-close manual run) is not double-counted
+    assert main_mod._held_days("2026-01-07T20:30:00+00:00", _DATES[2:12], _DATES[11]) == 9
+    # entered today -> 0
+    assert main_mod._held_days(_DATES[11], _DATES[2:11], _DATES[11]) == 0
