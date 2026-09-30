@@ -120,3 +120,20 @@ holdout +11.1% / 1.60 / 98th, paper window +6.4% / 1.15 / 86th (R0 medians +9.1%
 
 _To be filled after 2026-12-31: R0 distribution, R5 return and pct, live return and pct,
 verdict._
+
+## Addendum B — exploratory comparisons (added 2026-09-30, after the first live run)
+
+This addendum does **not** change the pass criteria above.
+
+The first live R5 run (2026-09-30 04:30 KST) bought SPY, AAPL, GOOGL, IVV, IWM and VOO.
+Ranking RSI-2 ties by 20-day average dollar volume puts the most liquid index ETFs first,
+so SPY, IVV and VOO — the same S&P 500 exposure — took three of the six new slots. R5's
+advantage over random tie-breaking may therefore come from buying the index on dips
+(market timing) rather than from stock selection.
+
+At evaluation, report these alongside the pre-registered verdict, labelled exploratory:
+
+- the live paper return versus SPY buy-and-hold over the same window;
+- the R5 simulation restricted to single stocks (ETFs excluded) versus R0 on the same
+  restricted universe;
+- the share of R5 entries that were ETFs, and how many held slots overlapped in one index.
